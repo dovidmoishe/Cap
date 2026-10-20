@@ -2,6 +2,7 @@ import argparse
 from datetime import datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -48,6 +49,21 @@ def main_window_number(log):
     if not number or not 0 < int(number[1]) <= 0xFFFFFFFF:
         raise RuntimeError("Main-window startup log has no valid window number")
     return int(number[1])
+
+
+def comparison_geometry(ready):
+    width, height = ready.get("pixelWidth"), ready.get("pixelHeight")
+    menu = ready.get("menuBarHeightPixels")
+    scale = ready.get("displayScale")
+    if type(width) is not int or type(height) is not int or width <= 32 or height <= 32:
+        raise ValueError("Desktop comparison requires valid full-display pixel dimensions")
+    if type(menu) is not int or not 0 <= menu < height - 16:
+        raise ValueError("Desktop comparison requires a measured menu-bar height within the image")
+    if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("Desktop comparison requires a finite positive display scale")
+    if ready.get("menuBarHeightSource") != "NSScreen.frame/visibleFrame":
+        raise ValueError("Desktop comparison requires native menu-bar geometry provenance")
+    return {key: ready[key] for key in ("pixelWidth", "pixelHeight", "menuBarHeightPixels", "displayScale", "menuBarHeightSource")}
 
 
 def request_desktop_preparation(directory, pid, number):
@@ -122,6 +138,7 @@ def run_variant(package, output, fixture, binary, *, capture_editor=True, deskto
             if desktop:
                 if ready.get("mode") != "desktop" or ready.get("activeDisplay") is not True or ready.get("helperWindowCount") != 0:
                     raise RuntimeError("Desktop helper did not verify an active display without helper windows")
+                record["inputComparisonGeometry"] = comparison_geometry(ready)
             elif ready.get("visible") is not True:
                 raise RuntimeError("Fixture is not visible")
             child = subprocess.Popen(

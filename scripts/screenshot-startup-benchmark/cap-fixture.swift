@@ -55,9 +55,10 @@ func pngEvidence(_ png: Data) throws -> [String: Any] {
     return imageEvidence(bitmap)
 }
 
-func compareImages(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep) throws -> [String: Any] {
+func compareImages(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep, excludedTopPixels: Int = comparisonBorder) throws -> [String: Any] {
     guard first.pixelsWide == second.pixelsWide, first.pixelsHigh == second.pixelsHigh,
-          first.pixelsWide > comparisonBorder * 2, first.pixelsHigh > comparisonBorder * 2 else {
+          first.pixelsWide > comparisonBorder * 2, first.pixelsHigh > comparisonBorder * 2,
+          excludedTopPixels >= comparisonBorder, excludedTopPixels < first.pixelsHigh - comparisonBorder else {
         throw NSError(domain: "comparison-dimensions", code: 1)
     }
     var interiorDifferences = 0
@@ -70,7 +71,7 @@ func compareImages(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep) throws
             let b = rawRGB(second, x: x, y: y)
             guard a.count == 3, b.count == 3 else { throw NSError(domain: "comparison-bitmap-format", code: 2) }
             let interior = x >= comparisonBorder && x < first.pixelsWide - comparisonBorder &&
-                y >= comparisonBorder && y < first.pixelsHigh - comparisonBorder
+                y >= excludedTopPixels && y < first.pixelsHigh - comparisonBorder
             if interior {
                 firstInterior.append(contentsOf: a.map { UInt8(($0 * 255).rounded()) })
                 secondInterior.append(contentsOf: b.map { UInt8(($0 * 255).rounded()) })
@@ -82,6 +83,7 @@ func compareImages(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep) throws
     }
     func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
     return ["width": first.pixelsWide, "height": first.pixelsHigh, "excludedBorderPixels": comparisonBorder,
+            "excludedTopPixels": excludedTopPixels,
             "interiorDifferentPixels": interiorDifferences, "interiorMatches": interiorDifferences == 0,
             "baselineInteriorSHA256": digest(firstInterior), "revisedInteriorSHA256": digest(secondInterior),
             "exteriorDifferentPixels": exterior.count, "exteriorDifferences": exterior]
@@ -139,6 +141,9 @@ final class Fixture: NSObject, NSApplicationDelegate {
             do {
                 try writeJSON(["mode": "desktop", "pixelWidth": CGDisplayPixelsWide(CGMainDisplayID()),
                                "pixelHeight": CGDisplayPixelsHigh(CGMainDisplayID()),
+                               "displayScale": screen.backingScaleFactor,
+                               "menuBarHeightPixels": Int(ceil(max(0, screen.frame.maxY - screen.visibleFrame.maxY) * screen.backingScaleFactor)),
+                               "menuBarHeightSource": "NSScreen.frame/visibleFrame",
                                "activeDisplay": CGDisplayIsActive(CGMainDisplayID()) != 0 && CGDisplayIsAsleep(CGMainDisplayID()) == 0,
                                "helperWindowCount": ownedWindows(getpid()).count],
                               to: directory.appendingPathComponent("fixture-ready.json"))
@@ -313,14 +318,22 @@ final class Fixture: NSObject, NSApplicationDelegate {
 struct Main {
     @MainActor
     static func main() {
-        if CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--compare-images" {
+        if (CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--compare-images") ||
+            (CommandLine.arguments.count == 5 && CommandLine.arguments[1] == "--compare-desktop-images") {
             do {
-                let images = try CommandLine.arguments.suffix(2).map { path -> NSBitmapImageRep in
+                let top: Int
+                if CommandLine.arguments[1] == "--compare-desktop-images" {
+                    guard let value = Int(CommandLine.arguments[4]) else { throw NSError(domain: "comparison-top", code: 1) }
+                    top = value
+                } else {
+                    top = comparisonBorder
+                }
+                let images = try CommandLine.arguments[2..<4].map { path -> NSBitmapImageRep in
                     let data = try Data(contentsOf: URL(fileURLWithPath: path))
                     guard let bitmap = NSBitmapImageRep(data: data) else { throw NSError(domain: "decode", code: 1) }
                     return bitmap
                 }
-                let data = try JSONSerialization.data(withJSONObject: compareImages(images[0], images[1]), options: [.sortedKeys])
+                let data = try JSONSerialization.data(withJSONObject: compareImages(images[0], images[1], excludedTopPixels: top), options: [.sortedKeys])
                 print(String(decoding: data, as: UTF8.self))
             } catch {
                 fputs("Image comparison failed: \(error)\n", stderr)

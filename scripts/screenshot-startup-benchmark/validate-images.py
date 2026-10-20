@@ -85,6 +85,32 @@ def validate(fixture, inputs, output):
         report = check(name, ["--compare-images", positive, path], expected, "interiorMatches")
         if (report["interiorDifferentPixels"], report["exteriorDifferentPixels"]) != ((1, 0) if not expected else (0, 1)):
             raise ValueError(f"{name}: difference reporting failed")
+    for name, x, y, expected in [
+        ("desktop-menu-last-row", 16, 23, True), ("desktop-first-row", 16, 24, False),
+        ("desktop-menu-previously-interior", 16, 16, True), ("desktop-interior-middle", 48, 32, False),
+        ("desktop-border-last-column", 15, 24, True), ("desktop-interior-last-column", width - 17, 24, False),
+        ("desktop-border-first-right-column", width - 16, 24, True),
+        ("desktop-interior-last-row", 16, height - 17, False), ("desktop-border-first-bottom-row", 16, height - 16, True),
+    ]:
+        changed = bytearray(pixels)
+        changed[(y * width + x) * 3] ^= 1
+        path = output / f"{name}.png"
+        write_png(path, width, height, changed)
+        report = check(name, ["--compare-desktop-images", positive, path, 24], expected, "interiorMatches")
+        if report.get("excludedTopPixels") != 24 or report.get("excludedBorderPixels") != 16:
+            raise ValueError(f"{name}: comparison geometry changed")
+        if (report["interiorDifferentPixels"], report["exteriorDifferentPixels"]) != ((1, 0) if not expected else (0, 1)):
+            raise ValueError(f"{name}: difference reporting failed")
+    for value in ["invalid", -1, 15, height - 16, height]:
+        name = f"desktop-invalid-top-{value}"
+        result = subprocess.run([str(fixture), "--compare-desktop-images", str(positive), str(positive), str(value)],
+                                capture_output=True, text=True, timeout=60, check=False)
+        (output / f"{name}.stdout.log").write_text(result.stdout)
+        (output / f"{name}.stderr.log").write_text(result.stderr)
+        results.append({"name": name, "expected": "nonzero exit", "returncode": result.returncode})
+        (output / "checks.json").write_text(json.dumps(results, indent=2))
+        if result.returncode == 0:
+            raise ValueError(f"{name}: invalid comparison geometry was accepted")
     print(f"Validated {len(results)} image checks", flush=True)
 
 

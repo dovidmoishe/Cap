@@ -33,6 +33,7 @@ def validate_capture(record):
     gpu = record["diagnosticGPU"]["elapsed_ms"]
     if not all(math.isfinite(value) and value > 0 for value in [preview, gpu]) or gpu < preview:
         raise ValueError("Missing, nonfinite, or inconsistent capture-to-frame timings")
+    return smoke.comparison_geometry(record.get("inputComparisonGeometry", {}))
 
 
 def summarize(records, samples):
@@ -65,9 +66,11 @@ def summarize(records, samples):
     return result
 
 
-def compare_inputs(fixture, first, second, output):
+def compare_inputs(fixture, first, second, output, *, geometry):
+    geometry = smoke.comparison_geometry(geometry)
+    top = max(16, geometry["menuBarHeightPixels"])
     result = subprocess.run(
-        [str(fixture), "--compare-images", str(first), str(second)],
+        [str(fixture), "--compare-desktop-images", str(first), str(second), str(top)],
         capture_output=True, text=True, timeout=60, check=False,
     )
     output.with_suffix(".stdout.log").write_text(result.stdout)
@@ -75,6 +78,10 @@ def compare_inputs(fixture, first, second, output):
     result.check_returncode()
     comparison = json.loads(result.stdout)
     output.with_suffix(".json").write_text(json.dumps(comparison, indent=2))
+    if (comparison.get("excludedTopPixels"), comparison.get("excludedBorderPixels"), comparison.get("width"), comparison.get("height")) != (
+        top, 16, geometry["pixelWidth"], geometry["pixelHeight"],
+    ):
+        raise ValueError("Image helper comparison geometry differs from the recorded native display geometry")
     if comparison.get("interiorMatches") is not True:
         raise ValueError(f"Capture input differs inside the fixed comparison region: {second}")
     return {key: value for key, value in comparison.items() if key != "exteriorDifferences"}
@@ -89,7 +96,8 @@ def collect(package, output, fixture, metadata, *, samples=12, warmups=2):
               "conditions": "fresh Cap process/profile per capture; warmed filesystem and driver caches",
               "editorImageRecording": False, "physicalScanoutMeasured": False,
               "inputMode": "desktop; Cap main window hidden before capture entry; no helper windows",
-              "excludedInputBorderPixels": 16, "outlierRemoval": "none", "results": None, "samples": records}
+              "excludedInputBorderPixels": 16, "inputComparisonGeometry": None,
+              "outlierRemoval": "none", "results": None, "samples": records}
     binaries = {binary["variant"]: binary for binary in metadata["binaries"]}
     started = time.monotonic()
     comparisons = output / "input-comparisons"
@@ -102,6 +110,7 @@ def collect(package, output, fixture, metadata, *, samples=12, warmups=2):
                 raise TimeoutError("Benchmark exceeded its 15-minute collection/validation deadline")
             record["inputComparison"] = compare_inputs(
                 fixture, reference, output / record["inputPNG"], comparisons / f"sample-{index:02d}",
+                geometry=report["inputComparisonGeometry"],
             )
             (output / "partial-results.json").write_text(json.dumps(report, indent=2))
 
@@ -118,7 +127,11 @@ def collect(package, output, fixture, metadata, *, samples=12, warmups=2):
                     record["inputPNG"] = (directory / record["inputPNG"]).relative_to(output).as_posix()
                 records.append(record)
                 (output / "partial-results.json").write_text(json.dumps(report, indent=2))
-                validate_capture(record)
+                geometry = validate_capture(record)
+                if report["inputComparisonGeometry"] is None:
+                    report["inputComparisonGeometry"] = geometry
+                elif report["inputComparisonGeometry"] != geometry:
+                    raise ValueError("Native desktop comparison geometry changed between captures")
             if phase == "warmup" and pair == warmups - 1:
                 validate_inputs(enumerate(records))
         validate_inputs((index, record) for index, record in enumerate(records) if record["phase"] == "measure")
@@ -141,6 +154,10 @@ def collect(package, output, fixture, metadata, *, samples=12, warmups=2):
 def render_report(report, provenance):
     probe = provenance["runnerProbe"]
     metadata = provenance["builds"]
+    geometry = report.get("inputComparisonGeometry")
+    menu = (f"Recorded menu-bar height: {geometry['menuBarHeightPixels']} pixels; top exclusion: "
+            f"{max(16, geometry['menuBarHeightPixels'])} pixels, measured using {geometry['menuBarHeightSource']}."
+            if geometry else "No valid native menu-bar geometry was accepted.")
     lines = [
         "# Cap screenshot startup on macOS CI", "",
         f"Status: {'PASS' if report['passed'] else 'FAIL / INCOMPLETE — no performance claim'}", "",
@@ -164,8 +181,11 @@ def render_report(report, provenance):
         "Capture IPC, draw hooks, and log polling remain enabled in both variants. The colored fixture is used only for smoke.",
         "Saved-PNG inspection runs after editor close. Warmup inputs must match before measured collection starts; "
         "measured inputs are compared after timing collection.", "",
-        "Inputs must match the reference exactly after excluding a fixed 16-pixel border on all four sides. "
-        "Full PNGs and individual border differences are retained. The excluded edges are not validated for equality.",
+        "Inputs must match the reference exactly after excluding the measured system menu-bar area and the existing "
+        "16-pixel image border. Display dimensions, scale, and menu-bar geometry must remain constant across captures.",
+        menu,
+        "Full-display PNGs are captured and processed without cropping or modification. All excluded pixel differences are retained. "
+        "Menu-bar and border pixels may differ and are not validated for equality; their capture and PNG processing remain in the timings.",
         "This run does not establish a flash-free preview handoff or performance on consumer Mac hardware.", "",
     ]
     if report["passed"]:

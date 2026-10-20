@@ -41,6 +41,7 @@ def main():
             report.update({"helper": ready, "target": target_ready})
             if ready.get("helperWindowCount") != 0 or ready.get("activeDisplay") is not True or target_ready.get("visible") is not True:
                 raise ValueError("Expected a windowless desktop helper and visible stand-in main panel")
+            report["inputComparisonGeometry"] = smoke.comparison_geometry(ready)
             number = target_ready.get("windowNumber")
             if target_ready.get("windowNumberOwnedOnScreen") is not True:
                 raise ValueError("Stand-in window number did not identify an owned on-screen native window")

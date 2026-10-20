@@ -17,10 +17,16 @@ benchmark = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(benchmark)
 
 
+def geometry():
+    return {"pixelWidth": 96, "pixelHeight": 64, "menuBarHeightPixels": 24,
+            "displayScale": 1, "menuBarHeightSource": "NSScreen.frame/visibleFrame"}
+
+
 def capture(variant, preview=100, gpu=200):
     return {"variant": variant, "passed": True, "editorImageRecording": False,
             "inputMode": "desktop", "desktopPreparation": {"hiddenBeforeCaptureMs": 1000},
             "diagnosticPreview": {"elapsed_ms": preview}, "diagnosticGPU": {"elapsed_ms": gpu},
+            "inputComparisonGeometry": geometry(),
             "inputPNG": f"{variant}/original.png"}
 
 
@@ -88,6 +94,7 @@ class CollectionTests(unittest.TestCase):
 
     def comparison(self, matches=True):
         return subprocess.CompletedProcess([], 0, json.dumps({"interiorMatches": matches,
+            "width": 96, "height": 64, "excludedTopPixels": 24, "excludedBorderPixels": 16,
             "interiorDifferentPixels": 0 if matches else 1, "exteriorDifferentPixels": 1,
             "exteriorDifferences": [{"x": 0, "y": 0}]}), "")
 
@@ -99,6 +106,9 @@ class CollectionTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertEqual(run.call_count, 28)
         self.assertEqual(compare.call_count, 28)
+        self.assertEqual(compare.call_args.args[0][1], "--compare-desktop-images")
+        self.assertEqual(compare.call_args.args[0][-1], "24")
+        self.assertEqual(report["inputComparisonGeometry"], geometry())
         self.assertEqual(report["results"]["gpu"]["baseline"]["count"], 12)
         self.assertEqual(sum(record["phase"] == "warmup" for record in report["samples"]), 4)
         self.assertTrue((self.root / "timings/input-comparisons/sample-00.json").is_file())
@@ -140,8 +150,46 @@ class CollectionTests(unittest.TestCase):
     def test_comparison_failure_preserves_stdout_and_stderr(self):
         result = subprocess.CompletedProcess([], 2, "partial", "decode failed")
         with patch.object(benchmark.subprocess, "run", return_value=result), self.assertRaises(subprocess.CalledProcessError):
-            benchmark.compare_inputs(self.root / "fixture", self.root / "a", self.root / "b", self.root / "failure")
+            benchmark.compare_inputs(self.root / "fixture", self.root / "a", self.root / "b", self.root / "failure", geometry=geometry())
         self.assertEqual((self.root / "failure.stderr.log").read_text(), "decode failed")
+
+
+    def test_changed_native_geometry_stops_collection_without_a_summary(self):
+        for field, value in [("menuBarHeightPixels", 25), ("displayScale", 2), ("pixelWidth", 192)]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                first, second = capture("baseline"), capture("revised")
+                second["inputComparisonGeometry"][field] = value
+                with patch.object(benchmark.smoke, "run_variant", side_effect=[first, second]), patch.object(benchmark, "compare_inputs") as compare:
+                    report = benchmark.collect(self.root, Path(temporary) / "timings", self.root / "fixture", self.metadata)
+                self.assertFalse(report["passed"])
+                self.assertIsNone(report["results"])
+                self.assertEqual(len(report["samples"]), 2)
+                self.assertIn("geometry changed", report["error"])
+                compare.assert_not_called()
+
+    def test_helper_cannot_silently_expand_the_comparison_region(self):
+        for changes in [{"excludedTopPixels": 25}, {"excludedBorderPixels": 17}, {"width": 192}, {"height": 128}]:
+            response = json.loads(self.comparison().stdout) | changes
+            with self.subTest(changes=changes), patch.object(benchmark.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(response), "")):
+                with self.assertRaisesRegex(ValueError, "geometry differs"):
+                    benchmark.compare_inputs(self.root / "fixture", self.root / "a", self.root / "b", self.root / "geometry", geometry=geometry())
+
+    def test_small_menu_preserves_the_existing_top_border(self):
+        native = geometry() | {"menuBarHeightPixels": 0}
+        response = json.loads(self.comparison().stdout) | {"excludedTopPixels": 16}
+        with patch.object(benchmark.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(response), "")) as compare:
+            benchmark.compare_inputs(self.root / "fixture", self.root / "a", self.root / "b", self.root / "small-menu", geometry=native)
+        self.assertEqual(compare.call_args.args[0][-1], "16")
+
+    def test_report_discloses_exclusion_without_claiming_identical_full_images(self):
+        with patch.object(benchmark.smoke, "run_variant", side_effect=self.fake_capture), patch.object(benchmark.subprocess, "run", return_value=self.comparison()):
+            report = benchmark.collect(self.root, self.root / "timings", self.root / "fixture", self.metadata)
+        text = benchmark.render_report(report, {"runnerProbe": {"os": "test macOS", "metalDevice": "test GPU",
+            "display": {"pixelWidth": 96, "pixelHeight": 64, "scale": 1}},
+            "builds": {"baseline_commit": "test baseline", "profile": "release"}, "package": {"buildRun": 123}})
+        self.assertIn("Recorded menu-bar height: 24 pixels; top exclusion: 24 pixels", text)
+        self.assertIn("without cropping or modification", text)
+        self.assertIn("capture and PNG processing remain in the timings", text)
 
 
 class CaptureModeTests(unittest.TestCase):
@@ -161,7 +209,7 @@ class CaptureModeTests(unittest.TestCase):
             def launch(command, **kwargs):
                 if "--run-desktop" in command:
                     (directory / "fixture-ready.json").write_text(json.dumps({"mode": "desktop", "activeDisplay": True,
-                        "helperWindowCount": 0, "pixelWidth": 96, "pixelHeight": 64}))
+                        "helperWindowCount": 0, **geometry()}))
                 else:
                     self.assertNotIn("DYLD_PRINT_LIBRARIES", kwargs["env"])
                     kwargs["stdout"].write("main window opened number=76\n")
@@ -242,6 +290,15 @@ class CaptureModeTests(unittest.TestCase):
 
 
 class DesktopPreparationTests(unittest.TestCase):
+    def test_menu_geometry_requires_native_provenance_and_valid_bounds(self):
+        self.assertEqual(benchmark.smoke.comparison_geometry(geometry()), geometry())
+        for changes in [{"pixelWidth": 32}, {"pixelHeight": None}, {"menuBarHeightPixels": None},
+                        {"menuBarHeightPixels": -1}, {"menuBarHeightPixels": 48}, {"menuBarHeightPixels": True},
+                        {"menuBarHeightPixels": 24.5}, {"menuBarHeightSource": "manual override"},
+                        {"displayScale": 0}, {"displayScale": math.nan}, {"displayScale": True}]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                benchmark.smoke.comparison_geometry(geometry() | changes)
+
     def test_window_number_comes_from_real_startup_log_not_an_editor_log(self):
         log = ('2026-10-20T19:28:52.006198Z INFO cap_gpui: main window opened number=76\n'
                '2026-10-20T19:28:54.160635Z INFO cap_gpui::app_windows: screenshot editor window opened number=85 path=test\n')
