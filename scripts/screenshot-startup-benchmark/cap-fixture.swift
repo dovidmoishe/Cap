@@ -143,7 +143,8 @@ struct Main {
     static func main() {
         guard CommandLine.arguments.count == 3 else { exit(2) }
         if CommandLine.arguments[1] == "--inspect-image" {
-            guard let bitmap = NSBitmapImageRep(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2])),
+            guard let contents = try? Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2])),
+                  let bitmap = NSBitmapImageRep(data: contents),
                   let data = try? JSONSerialization.data(withJSONObject: imageEvidence(bitmap), options: [.sortedKeys]),
                   let text = String(data: data, encoding: .utf8) else { exit(2) }
             print(text)

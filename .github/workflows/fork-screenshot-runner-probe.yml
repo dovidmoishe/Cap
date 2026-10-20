@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: fork-screenshot-runner-probe-${{ github.ref }}
   cancel-in-progress: true
@@ -44,6 +48,7 @@ jobs:
             -framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit \
             scripts/screenshot-startup-benchmark/runner-probe.swift \
             -o "$PROBE_OUTPUT/runner-probe" 2>&1 | tee "$PROBE_OUTPUT/compile.log"
+          test -x "$PROBE_OUTPUT/runner-probe"
       - name: Check visible window, Metal, and full-display capture
         run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$PROBE_OUTPUT"
       - name: Upload diagnostic evidence

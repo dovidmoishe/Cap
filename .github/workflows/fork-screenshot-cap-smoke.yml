@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: fork-cap-screenshot-smoke-${{ github.ref }}
   cancel-in-progress: true
@@ -44,12 +48,20 @@ jobs:
             -framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit \
             scripts/screenshot-startup-benchmark/runner-probe.swift \
             -o "$SMOKE_OUTPUT/preflight/runner-probe" 2>&1 | tee "$SMOKE_OUTPUT/probe-compile.log"
+          test -x "$SMOKE_OUTPUT/preflight/runner-probe"
           xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
             -framework AppKit -framework ScreenCaptureKit \
             scripts/screenshot-startup-benchmark/cap-fixture.swift \
             -o "$SMOKE_OUTPUT/cap-fixture" 2>&1 | tee "$SMOKE_OUTPUT/fixture-compile.log"
+          test -x "$SMOKE_OUTPUT/cap-fixture"
       - name: Verify graphics and capture on this job's runner
         run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$SMOKE_OUTPUT/preflight"
+      - name: Verify fixture decoder before building Cap
+        run: |
+          "$SMOKE_OUTPUT/cap-fixture" --inspect-image "$SMOKE_OUTPUT/preflight/captured-display.png" \
+            | tee "$SMOKE_OUTPUT/fixture-selfcheck.json"
+          python3 -c 'import json, sys; result = json.load(sys.stdin); sys.exit(0 if result.get("fixtureMatches") is True else 1)' \
+            < "$SMOKE_OUTPUT/fixture-selfcheck.json"
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt
