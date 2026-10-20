@@ -174,6 +174,7 @@ class CaptureModeTests(unittest.TestCase):
                     self.assertEqual((directory / "cap-pid").read_text(), "42")
                     (directory / "desktop-hidden.json").write_text(json.dumps({"ownerPID": 42, "hidden": True,
                         "visibleMainWindows": 0, "mainWindowLevel": 100, "stableHiddenMs": 300,
+                        "hideRequestCount": 1, "hideReturned": False,
                         "hiddenUTC": "2026-10-20T00:00:00Z"}))
                     (directory / "cap.log").write_text('main window opened\n'
                         '2026-10-20T00:00:01Z INFO CAP_BENCH_CAPTURE\n'
@@ -244,11 +245,13 @@ class DesktopPreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             evidence = {"ownerPID": 42, "hidden": True, "visibleMainWindows": 0,
-                        "mainWindowLevel": 100, "stableHiddenMs": 300, "hiddenUTC": "2026-10-20T00:00:00Z"}
+                        "mainWindowLevel": 100, "stableHiddenMs": 300, "hiddenUTC": "2026-10-20T00:00:00Z",
+                        "hideRequestCount": 1, "hideReturned": False}
             log = "2026-10-20T00:00:01Z INFO CAP_BENCH_CAPTURE\n"
             cases = [{"ownerPID": 99}, {"hidden": False}, {"visibleMainWindows": 1}, {"mainWindowLevel": 0},
                      {"stableHiddenMs": 100}, {"hiddenUTC": "2026-10-20T00:00:00.900Z"},
-                     {"hiddenUTC": "2026-10-20T00:00:01.100Z"}]
+                     {"hiddenUTC": "2026-10-20T00:00:01.100Z"}, {"hideRequestCount": 2}, {"hideRequestCount": 0},
+                     {"hideReturned": None}, {"hideReturned": "false"}]
             for changes in cases:
                 with self.subTest(changes=changes):
                     (directory / "desktop-hidden.json").write_text(json.dumps(evidence | changes))
@@ -259,6 +262,7 @@ class DesktopPreparationTests(unittest.TestCase):
                 benchmark.smoke.validate_desktop_preparation(directory, 42, "no capture event")
             result = benchmark.smoke.validate_desktop_preparation(directory, 42, log)
             self.assertEqual(result["hiddenBeforeCaptureMs"], 1000)
+            self.assertFalse(result["evidence"]["hideReturned"])
 
 
 if __name__ == "__main__":

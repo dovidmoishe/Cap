@@ -48,10 +48,12 @@ def main():
             report["hidden"] = hidden
             if hidden.get("ownerPID") != children[1].pid or hidden.get("hidden") is not True or hidden.get("visibleMainWindows") != 0 or hidden.get("stableHiddenMs", 0) < 250:
                 raise ValueError("Stand-in main panel did not become stably hidden")
+            if hidden.get("hideRequestCount") != 1 or type(hidden.get("hideReturned")) is not bool:
+                raise ValueError("Expected one hide request with its return value retained as evidence")
             (target_dir / "unhide-request").write_text("ready")
             resumed = wait_json(target_dir / "resumed.json", children)
             report["resumed"] = resumed
-            if resumed.get("hidden") is not False or resumed.get("visible") is not True:
+            if resumed.get("hidden") is not False or resumed.get("visible") is not True or resumed.get("visibleWindowCount", 0) < 1:
                 raise ValueError("Desktop helper interfered after acknowledging setup")
             report["passed"] = True
     except Exception as error:

@@ -104,6 +104,9 @@ final class Fixture: NSObject, NSApplicationDelegate {
     private var hiddenSince: TimeInterval?
     private var mainWindowObserved = false
     private var resumed = false
+    private var preparationStartedAt: TimeInterval?
+    private var hideReturned: Bool?
+    private var activationPolicyAtRequest: Int?
 
     init(directory: URL, mode: Mode = .colored) {
         self.directory = directory
@@ -185,20 +188,34 @@ final class Fixture: NSObject, NSApplicationDelegate {
             guard let pid = Int32(try String(contentsOf: request, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)),
                   pid != getpid() else { throw NSError(domain: "cap-pid", code: 1) }
             guard let application = NSRunningApplication(processIdentifier: pid) else { return }
-            let mainWindows = try ownedWindows(pid).filter { ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 100 }
+            let now = ProcessInfo.processInfo.systemUptime
+            if preparationStartedAt == nil { preparationStartedAt = now }
+            let windows = try ownedWindows(pid)
+            let mainWindows = windows.filter { ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 100 }
             if !mainWindows.isEmpty { mainWindowObserved = true }
+            try writeJSON(["ownerPID": pid, "hidden": application.isHidden,
+                           "activationPolicy": application.activationPolicy.rawValue,
+                           "mainWindowObserved": mainWindowObserved, "visibleMainWindows": mainWindows.count,
+                           "visibleWindowLayers": windows.compactMap { ($0[kCGWindowLayer as String] as? NSNumber)?.intValue },
+                           "hideRequested": hideReturned != nil, "hideReturned": hideReturned.map { $0 as Any } ?? NSNull()],
+                          to: directory.appendingPathComponent("desktop-state.json"))
+            if let started = preparationStartedAt, now - started > 3 {
+                throw NSError(domain: "desktop-preparation-timeout", code: 3)
+            }
             guard mainWindowObserved else { return }
-            if !application.isHidden {
-                hiddenSince = nil
-                guard application.hide() else { throw NSError(domain: "application-hide", code: 2) }
+            if hideReturned == nil {
+                activationPolicyAtRequest = application.activationPolicy.rawValue
+                hideReturned = application.hide()
                 return
             }
-            guard mainWindows.isEmpty else { hiddenSince = nil; return }
-            let now = ProcessInfo.processInfo.systemUptime
+            guard application.isHidden && mainWindows.isEmpty else { hiddenSince = nil; return }
             guard let since = hiddenSince else { hiddenSince = now; return }
             guard now - since >= 0.25 else { return }
             try writeJSON(["ownerPID": pid, "hidden": true, "hiddenUTC": utc(),
                            "visibleMainWindows": mainWindows.count, "mainWindowLevel": 100,
+                           "hideRequestCount": 1, "hideReturned": hideReturned ?? false,
+                           "activationPolicyAtRequest": activationPolicyAtRequest ?? -1,
+                           "activationPolicy": application.activationPolicy.rawValue,
                            "stableHiddenMs": (now - since) * 1000],
                           to: directory.appendingPathComponent("desktop-hidden.json"))
             hidden = true
@@ -219,7 +236,8 @@ final class Fixture: NSObject, NSApplicationDelegate {
             NSApplication.shared.activate(ignoringOtherApps: true)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
                 do {
-                    try writeJSON(["hidden": NSApplication.shared.isHidden, "visible": window?.isVisible == true],
+                    try writeJSON(["hidden": NSApplication.shared.isHidden, "visible": window?.isVisible == true,
+                                   "visibleWindowCount": ownedWindows(getpid()).count],
                                   to: directory.appendingPathComponent("resumed.json"))
                 } catch { fail(error) }
             }

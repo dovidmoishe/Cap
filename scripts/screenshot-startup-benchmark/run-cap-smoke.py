@@ -49,6 +49,8 @@ def validate_desktop_preparation(directory, pid, log):
         raise RuntimeError("Desktop preparation did not verify the owned Cap main window was hidden")
     if hidden.get("mainWindowLevel") != 100 or hidden.get("stableHiddenMs", 0) < 250:
         raise RuntimeError("Desktop preparation did not verify a stable hidden main panel")
+    if hidden.get("hideRequestCount") != 1 or type(hidden.get("hideReturned")) is not bool:
+        raise RuntimeError("Desktop preparation did not record exactly one hide request and its return value")
     started = datetime.fromisoformat(capture[1].replace("Z", "+00:00"))
     completed = datetime.fromisoformat(hidden["hiddenUTC"].replace("Z", "+00:00"))
     margin = (started - completed).total_seconds() * 1000
