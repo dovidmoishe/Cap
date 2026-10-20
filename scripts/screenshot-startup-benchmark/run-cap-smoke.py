@@ -40,7 +40,7 @@ def inspect_image(fixture, path, output):
     return json.loads(result.stdout)
 
 
-def run_variant(package, output, fixture, binary):
+def run_variant(package, output, fixture, binary, *, capture_editor=True):
     directory = output / binary["variant"]
     directory.mkdir()
     profile = directory / "profile"
@@ -60,14 +60,15 @@ def run_variant(package, output, fixture, binary):
         "DYLD_FRAMEWORK_PATH": str(package / "runtime/Frameworks"),
         "DYLD_LIBRARY_PATH": str(package / "runtime/lib") + os.pathsep + str(package / "runtime/onnxruntime"),
         "ORT_DYLIB_PATH": str(package / "runtime/onnxruntime/libonnxruntime.dylib"),
-        "DYLD_PRINT_LIBRARIES": "1",
     })
+    if capture_editor:
+        environment["DYLD_PRINT_LIBRARIES"] = "1"
     executable = package / binary["executable"]
     if hashlib.sha256(executable.read_bytes()).hexdigest() != binary["sha256"]:
         raise ValueError("Executable hash differs from build provenance")
     child = None
     scene = None
-    record = {"variant": binary["variant"], "passed": False}
+    record = {"variant": binary["variant"], "passed": False, "editorImageRecording": capture_editor}
     try:
         with (directory / "fixture.log").open("w") as fixture_log, (directory / "cap.log").open("w") as cap_log:
             scene = subprocess.Popen([str(fixture), "--run", str(directory)], stdout=fixture_log, stderr=subprocess.STDOUT)
@@ -91,7 +92,7 @@ def run_variant(package, output, fixture, binary):
                 preview = draw(log, "preview")
                 gpu = draw(log, "gpu")
                 closed = "screenshot editor window closed" in log
-                if gpu and not requested:
+                if gpu and capture_editor and not requested:
                     (directory / "editor-pid").write_text(str(child.pid))
                     requested = True
                 if preview and gpu and closed:
@@ -122,10 +123,12 @@ def run_variant(package, output, fixture, binary):
                 raise RuntimeError("Saved screenshot does not contain the fixed full-display scene")
             if (image["width"], image["height"]) != (ready["pixelWidth"], ready["pixelHeight"]):
                 raise RuntimeError("Saved screenshot dimensions differ from the fixture display")
-            editor = json.loads((directory / "editor-evidence.json").read_text())
-            record["editor"] = editor
-            if editor.get("containsFixtureColors") is not True or editor.get("ownerPID") != child.pid:
-                raise RuntimeError(f"Native editor image did not verify the captured scene: {editor}")
+            editor = None
+            if capture_editor:
+                editor = json.loads((directory / "editor-evidence.json").read_text())
+                record["editor"] = editor
+                if editor.get("containsFixtureColors") is not True or editor.get("ownerPID") != child.pid:
+                    raise RuntimeError(f"Native editor image did not verify the captured scene: {editor}")
             if preview["bounds"] != gpu["bounds"]:
                 raise RuntimeError("Preview and GPU image bounds differ")
             record.update({
@@ -148,13 +151,7 @@ def run_variant(package, output, fixture, binary):
     return record
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("output", type=Path)
-    parser.add_argument("--package", type=Path, required=True)
-    args = parser.parse_args()
-    output = args.output.resolve()
-    package = args.package.resolve()
+def load_package(package):
     metadata = json.loads((package / "builds/binaries.json").read_text())
     if metadata.get("validate_only") or len(metadata["binaries"]) != 2:
         raise ValueError("Expected two compiled release binaries")
@@ -163,6 +160,17 @@ def main():
         raise ValueError("Runtime package does not match the current production snapshot")
     if metadata["instrumentation_sha256"] != hashlib.sha256((scripts / "build-cap.py").read_text().encode()).hexdigest():
         raise ValueError("Runtime package uses different measurement instrumentation")
+    return metadata
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--package", type=Path, required=True)
+    args = parser.parse_args()
+    output = args.output.resolve()
+    package = args.package.resolve()
+    metadata = load_package(package)
     fixture = output / "cap-fixture"
     runs = [run_variant(package, output, fixture, binary) for binary in metadata["binaries"]]
     passed = all(run["passed"] for run in runs)

@@ -1,4 +1,4 @@
-name: Fork Cap screenshot smoke
+name: Fork Cap screenshot benchmark
 
 on:
   push:
@@ -74,6 +74,7 @@ jobs:
             "$RUNNER_TEMP/image-validation/cap-fixture" "$RUNNER_TEMP/image-validation/input" \
             "$RUNNER_TEMP/image-validation/checks"
           python3 scripts/screenshot-startup-benchmark/test-tooling.py
+          python3 scripts/screenshot-startup-benchmark/test-benchmark.py
       - name: Verify graphics before allowing a Cap build
         run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$RUNNER_TEMP/image-validation"
       - name: Upload validator evidence
@@ -156,7 +157,7 @@ jobs:
     needs: [validate, build]
     if: always() && needs.validate.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: macos-15
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -207,6 +208,10 @@ jobs:
         run: |
           python3 scripts/screenshot-startup-benchmark/run-cap-smoke.py "$SMOKE_OUTPUT" \
             --package "$RUNNER_TEMP/extracted-cap/package"
+      - name: Measure repeated captures without editor image recording
+        run: |
+          python3 scripts/screenshot-startup-benchmark/run-benchmark.py "$SMOKE_OUTPUT" \
+            --package "$RUNNER_TEMP/extracted-cap/package" --samples 12 --warmup-pairs 2
       - name: Upload all smoke evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
