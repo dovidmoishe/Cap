@@ -1,0 +1,21 @@
+{
+	"baseline_commit": "346561b837aaa2cd27eea01b90b858d6596848b5",
+	"production_branch": "perf/screenshot-editor-startup",
+	"production_parent_commit": "eb386b47e297d3247d33d9e2c8307efed015dda1",
+	"snapshot_status": "uncommitted reviewer-requested production revisions; no benchmark hooks",
+	"patch_sha256": "9ed717c9d2e01020a8f55a9d22abd300d80a83324d921a5488ace84b2616ebe1",
+	"source_hash_encoding": "UTF-8 with LF line endings",
+	"baseline_sources": {
+		"screenshot.rs": "0be43f7ad6ee46cf74f4fa6d82bcdac0218590c394c4a576c526d1b7f3f9d749",
+		"screenshot_editor.rs": "5578cf95d033e907ff172854ef6098841bee861121d1c42c2af6834fcf5938d7",
+		"app_windows.rs": "9ff0d296f56384baa697b7c40c85df9e7379826ec2ed9ef14d2ef35004dc7a92",
+		"main.rs": "41068d3610dbcb0e3485919d65c165248e03f611b867b59f120e28933eaee7e9"
+	},
+	"revised_sources": {
+		"screenshot.rs": "cf5a9ed9adcf16070284991ecc890ffb224a2b0858416441fbf41a69c02535e0",
+		"screenshot_editor.rs": "f315e801c4db8c0f0046e3eebefe631deedac90ee302f836c7baf47eea8ad334",
+		"app_windows.rs": "8b8e966a4137a25f956bc9743353fbe5e89cd8a69d6ff665a452e5883d835a4a",
+		"main.rs": "41068d3610dbcb0e3485919d65c165248e03f611b867b59f120e28933eaee7e9"
+	},
+	"patch_format": "git unified diff with zero context; UTF-8 with LF line endings for SHA-256"
+}

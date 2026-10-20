@@ -1,0 +1,325 @@
+diff --git a/apps/desktop-gpui/src/app_windows.rs b/apps/desktop-gpui/src/app_windows.rs
+index ae2ecce79..a7acd4756 100644
+--- a/apps/desktop-gpui/src/app_windows.rs
++++ b/apps/desktop-gpui/src/app_windows.rs
+@@ -6499,2 +6499,7 @@ pub fn prepare_for_screenshot_capture(cx: &mut App) -> bool {
+-pub fn screenshot_finished(captured: Option<PathBuf>, cx: &mut App) {
+-    let Some(png) = captured else {
++pub fn screenshot_finished(captured: Option<crate::screenshot::CapturedScreenshot>, cx: &mut App) {
++    let Some(crate::screenshot::CapturedScreenshot {
++        png,
++        source,
++        behaviour,
++    }) = captured
++    else {
+@@ -6518 +6522,0 @@ pub fn screenshot_finished(captured: Option<PathBuf>, cx: &mut App) {
+-    let behaviour = crate::store::GeneralSettings::load().post_screenshot_behaviour;
+@@ -6530 +6534 @@ pub fn screenshot_finished(captured: Option<PathBuf>, cx: &mut App) {
+-        open_screenshot_editor(png, cx);
++        open_screenshot_editor_with_source(png, source, cx);
+@@ -6551,0 +6556,8 @@ pub fn open_screenshot_editor(path: PathBuf, cx: &mut App) {
++    open_screenshot_editor_with_source(path, None, cx);
++}
++
++fn open_screenshot_editor_with_source(
++    path: PathBuf,
++    source: Option<screenshot_editor::LoadedSource>,
++    cx: &mut App,
++) {
+@@ -6653 +6665 @@ pub fn open_screenshot_editor(path: PathBuf, cx: &mut App) {
+-    screenshot_editor::load_screenshot_project(key, handle, cx);
++    screenshot_editor::load_screenshot_project(key, handle, source, cx);
+diff --git a/apps/desktop-gpui/src/screenshot.rs b/apps/desktop-gpui/src/screenshot.rs
+index b01af4894..4fafc7708 100644
+--- a/apps/desktop-gpui/src/screenshot.rs
++++ b/apps/desktop-gpui/src/screenshot.rs
+@@ -21 +21,7 @@ use gpui::App;
+-use crate::app_windows;
++use crate::{app_windows, screenshot_editor::LoadedSource};
++
++pub struct CapturedScreenshot {
++    pub png: PathBuf,
++    pub source: Option<LoadedSource>,
++    pub behaviour: crate::store::PostScreenshotBehaviour,
++}
+@@ -31 +37,4 @@ pub fn take_screenshot(target: ScreenCaptureTarget, cx: &mut App) {
+-
++    let behaviour = crate::store::GeneralSettings::load().post_screenshot_behaviour;
++    if behaviour.opens_editor() {
++        app_windows::prewarm_shared_wgpu_device(cx);
++    }
+@@ -41 +50 @@ pub fn take_screenshot(target: ScreenCaptureTarget, cx: &mut App) {
+-        capture_and_write(target).await
++        capture_and_write(target, behaviour.opens_editor()).await
+@@ -46,4 +55,5 @@ pub fn take_screenshot(target: ScreenCaptureTarget, cx: &mut App) {
+-            Ok(png) => {
+-                tracing::info!(path = %png.display(), "screenshot captured");
+-                Some(png)
+-            }
++            Ok((png, source)) => Some(CapturedScreenshot {
++                png,
++                source,
++                behaviour,
++            }),
+@@ -60,10 +70,6 @@ pub fn take_screenshot(target: ScreenCaptureTarget, cx: &mut App) {
+-/// Capture, then write the `.cap` bundle. Returns the PNG path, which is what
+-/// the Tauri command returns (`NewScreenshotAdded.path` is the PNG, not the
+-/// bundle).
+-async fn capture_and_write(target: ScreenCaptureTarget) -> anyhow::Result<PathBuf> {
+-    let image = cap_recording::screenshot::capture_screenshot(target.clone())
+-        .await
+-        .context("capturing the screenshot")?;
+-
+-    crate::app_sounds::AppSound::Notification.play();
+-
++fn create_capture_project(
++    target: &ScreenCaptureTarget,
++) -> anyhow::Result<(
++    cap_project::RecordingMeta,
++    cap_project::ProjectConfiguration,
++)> {
+@@ -96 +102 @@ async fn capture_and_write(target: ScreenCaptureTarget) -> anyhow::Result<PathBu
+-        pretty_name,
++        pretty_name: pretty_name.clone(),
+@@ -116 +122 @@ async fn capture_and_write(target: ScreenCaptureTarget) -> anyhow::Result<PathBu
+-        .map_err(|e| anyhow!("saving screenshot meta: {e}"))?;
++        .map_err(|error| anyhow!("saving screenshot meta: {error}"))?;
+@@ -126 +132,4 @@ async fn capture_and_write(target: ScreenCaptureTarget) -> anyhow::Result<PathBu
+-        .map_err(|e| anyhow!("saving screenshot project config: {e}"))?;
++        .map_err(|error| anyhow!("saving screenshot project config: {error}"))?;
++
++    Ok((meta, config))
++}
+@@ -128,3 +137,31 @@ async fn capture_and_write(target: ScreenCaptureTarget) -> anyhow::Result<PathBu
+-    let png = bundle.join("original.png");
+-    write_png(png.clone(), image).await?;
+-    Ok(png)
++async fn capture_and_write(
++    target: ScreenCaptureTarget,
++    retain_rgba: bool,
++) -> anyhow::Result<(PathBuf, Option<LoadedSource>)> {
++    let image = cap_recording::screenshot::capture_screenshot(target.clone())
++        .await
++        .context("capturing the screenshot")?;
++    crate::app_sounds::AppSound::Notification.play();
++    let (meta, config) = create_capture_project(&target)?;
++    let png = meta.project_path.join("original.png");
++    let width = image.width();
++    let height = image.height();
++    let rgba = write_png(png.clone(), image, retain_rgba).await?;
++    tracing::info!(path = %png.display(), "screenshot captured");
++    let source = if let Some(rgba) = rgba {
++        let cap_project::RecordingMetaInner::Studio(studio_meta) = &meta.inner else {
++            return Err(anyhow!("screenshot metadata is not a studio project"));
++        };
++        Some(LoadedSource {
++            rgba: std::sync::Arc::new(rgba),
++            width,
++            height,
++            pretty_name: meta.pretty_name.clone(),
++            config,
++            studio_meta: (**studio_meta).clone(),
++            meta,
++        })
++    } else {
++        None
++    };
++    Ok((png, source))
+@@ -136 +173,5 @@ async fn capture_and_write(target: ScreenCaptureTarget) -> anyhow::Result<PathBu
+-async fn write_png(path: PathBuf, image: image::DynamicImage) -> anyhow::Result<()> {
++async fn write_png(
++    path: PathBuf,
++    image: image::DynamicImage,
++    retain_rgba: bool,
++) -> anyhow::Result<Option<Vec<u8>>> {
+@@ -148,0 +190 @@ async fn write_png(path: PathBuf, image: image::DynamicImage) -> anyhow::Result<
++        let rgba = retain_rgba.then(|| image.to_rgba8().into_raw());
+@@ -162 +204,2 @@ async fn write_png(path: PathBuf, image: image::DynamicImage) -> anyhow::Result<
+-        .context("encoding the screenshot PNG")
++        .context("encoding the screenshot PNG")?;
++        Ok(rgba)
+@@ -166,0 +210,86 @@ async fn write_png(path: PathBuf, image: image::DynamicImage) -> anyhow::Result<
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn retained_capture_pixels_match_saved_rgb_and_alpha() {
++        let directory = tempfile::tempdir().unwrap();
++        let images = [
++            image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(4, 2, |x, y| {
++                image::Rgb([x as u8 * 40, y as u8 * 80, 173])
++            })),
++            image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(4, 2, |x, y| {
++                image::Rgba([x as u8 * 40, y as u8 * 80, 173, x as u8 * 70])
++            })),
++        ];
++        for (index, image) in images.into_iter().enumerate() {
++            let path = directory.path().join(format!("{index}.png"));
++            let expected = image.to_rgba8().into_raw();
++            let retained = write_png(path.clone(), image, true).await.unwrap().unwrap();
++            let saved = image::open(path).unwrap().to_rgba8().into_raw();
++            assert_eq!(retained, expected);
++            assert_eq!(saved, retained);
++        }
++    }
++
++    #[tokio::test]
++    async fn oversized_capture_pixels_can_still_be_saved() {
++        let directory = tempfile::tempdir().unwrap();
++        for (width, height) in [(16_385, 2), (4, 16_385)] {
++            let path = directory.path().join("original.png");
++            let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
++                width,
++                height,
++                image::Rgba([13, 71, 129, 255]),
++            ));
++            let retained = write_png(path.clone(), image, true).await.unwrap().unwrap();
++            let saved = image::open(&path).unwrap().to_rgba8();
++            assert_eq!(saved.dimensions(), (width, height));
++            assert_eq!(saved.as_raw(), &retained);
++            assert!(matches!(
++                crate::screenshot_editor::load_source(directory.path()),
++                Err(message) if message == format!("Image dimensions exceed maximum: {width}x{height}")
++            ));
++            assert!(path.exists());
++        }
++    }
++
++    #[tokio::test]
++    async fn copy_and_save_only_encode_without_retaining_pixels() {
++        let directory = tempfile::tempdir().unwrap();
++        for (index, image) in [
++            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
++                4,
++                2,
++                image::Rgb([13, 71, 129]),
++            )),
++            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
++                4,
++                2,
++                image::Rgba([13, 71, 129, 83]),
++            )),
++        ]
++        .into_iter()
++        .enumerate()
++        {
++            let path = directory.path().join(format!("{index}.png"));
++            let expected = image.to_rgba8();
++            assert!(
++                write_png(path.clone(), image, false)
++                    .await
++                    .unwrap()
++                    .is_none()
++            );
++            assert_eq!(image::open(path).unwrap().to_rgba8(), expected);
++        }
++    }
++
++    #[tokio::test]
++    async fn failed_capture_save_does_not_deliver_pixels() {
++        let directory = tempfile::tempdir().unwrap();
++        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(4, 2));
++        let result = write_png(directory.path().to_path_buf(), image, true).await;
++        assert!(result.is_err());
++    }
++}
+diff --git a/apps/desktop-gpui/src/screenshot_editor.rs b/apps/desktop-gpui/src/screenshot_editor.rs
+index 7e83655f2..476778079 100644
+--- a/apps/desktop-gpui/src/screenshot_editor.rs
++++ b/apps/desktop-gpui/src/screenshot_editor.rs
+@@ -60 +60 @@ pub const SCREENSHOT_EDITOR_MIN_HEIGHT: f32 = 600.;
+-const MAX_DIMENSION: u32 = 16_384;
++pub(crate) const MAX_DIMENSION: u32 = 16_384;
+@@ -109 +109 @@ pub struct LoadedSource {
+-    pub rgba: Vec<u8>,
++    pub rgba: Arc<Vec<u8>>,
+@@ -156 +156 @@ pub fn load_source(bundle: &Path) -> Result<LoadedSource, String> {
+-        rgba: image.to_rgba8().into_raw(),
++        rgba: Arc::new(image.to_rgba8().into_raw()),
+@@ -165,0 +166,14 @@ pub fn load_source(bundle: &Path) -> Result<LoadedSource, String> {
++fn load_source_for_editor(
++    bundle: &Path,
++    captured: Option<LoadedSource>,
++) -> Result<LoadedSource, String> {
++    let source = captured.map_or_else(|| load_source(bundle), Ok)?;
++    if source.width > MAX_DIMENSION || source.height > MAX_DIMENSION {
++        return Err(format!(
++            "Image dimensions exceed maximum: {}x{}",
++            source.width, source.height
++        ));
++    }
++    Ok(source)
++}
++
+@@ -227 +241 @@ pub async fn run_still_renderer(
+-    let decoded = DecodedFrame::new_with_arc(Arc::new(source.rgba), source.width, source.height);
++    let decoded = DecodedFrame::new_with_arc(source.rgba, source.width, source.height);
+@@ -4762,0 +4777 @@ pub fn load_screenshot_project(
++    captured: Option<LoadedSource>,
+@@ -4765,0 +4781 @@ pub fn load_screenshot_project(
++        let fresh_capture = captured.is_some();
+@@ -4769 +4785 @@ pub fn load_screenshot_project(
+-            .spawn(async move { load_source(&load_bundle) })
++            .spawn(async move { load_source_for_editor(&load_bundle, captured) })
+@@ -4791,0 +4808,24 @@ pub fn load_screenshot_project(
++        let (source, preview) = cx
++            .background_executor()
++            .spawn(async move {
++                let preview = if fresh_capture
++                    && source.width.is_multiple_of(4)
++                    && source.height.is_multiple_of(2)
++                {
++                    image::RgbaImage::from_raw(
++                        source.width,
++                        source.height,
++                        source.rgba.as_ref().clone(),
++                    )
++                    .map(|image| {
++                        (
++                            source.rgba.clone(),
++                            crate::library::rgba_to_render_image(image),
++                        )
++                    })
++                } else {
++                    None
++                };
++                (source, preview)
++            })
++            .await;
+@@ -4804 +4844,4 @@ pub fn load_screenshot_project(
+-                )
++                );
++                if let Some((rgba, image)) = preview {
++                    view.frame_arrived(image, rgba, image_size, window, cx);
++                }
+@@ -4844 +4887,3 @@ pub fn load_screenshot_project(
+-                    view.frame_arrived(image, rgba, size, window, cx)
++                    if revision >= view.revision {
++                        view.frame_arrived(image, rgba, size, window, cx);
++                    }
+@@ -5137 +5182 @@ mod tests {
+-            rgba,
++            rgba: Arc::new(rgba),
+@@ -5146,0 +5192,20 @@ mod tests {
++    #[test]
++    fn retained_capture_pixels_obey_the_editor_dimension_limit() {
++        for (width, height) in [(MAX_DIMENSION + 1, 2), (4, MAX_DIMENSION + 1)] {
++            let result = load_source_for_editor(
++                Path::new("unused.cap"),
++                Some(synthetic_source(width, height)),
++            );
++            assert!(
++                matches!(result, Err(message) if message == format!("Image dimensions exceed maximum: {width}x{height}"))
++            );
++        }
++        assert!(
++            load_source_for_editor(
++                Path::new("unused.cap"),
++                Some(synthetic_source(MAX_DIMENSION, 2)),
++            )
++            .is_ok()
++        );
++    }
++

@@ -1,0 +1,83 @@
+name: Fork Cap screenshot smoke
+
+on:
+  push:
+    branches: [perf/screenshot-startup-benchmark]
+    paths:
+      - .github/workflows/fork-screenshot-cap-smoke.yml
+      - scripts/screenshot-startup-benchmark/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-cap-screenshot-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    if: github.repository == 'dovidmoishe/Cap'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0
+      RUST_TARGET_TRIPLE: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Prepare output and record environment
+        run: |
+          SMOKE_OUTPUT="$RUNNER_TEMP/cap-screenshot-smoke"
+          echo "SMOKE_OUTPUT=$SMOKE_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$SMOKE_OUTPUT/preflight"
+          sw_vers > "$SMOKE_OUTPUT/os.txt"
+          uname -m >> "$SMOKE_OUTPUT/os.txt"
+          xcodebuild -version >> "$SMOKE_OUTPUT/os.txt"
+          printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion" >> "$SMOKE_OUTPUT/os.txt"
+          system_profiler SPHardwareDataType SPDisplaysDataType -json > "$SMOKE_OUTPUT/hardware.json"
+          df -h > "$SMOKE_OUTPUT/disk-before.txt"
+      - name: Compile runner and fixture helpers
+        run: |
+          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
+            -framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit \
+            scripts/screenshot-startup-benchmark/runner-probe.swift \
+            -o "$SMOKE_OUTPUT/preflight/runner-probe" 2>&1 | tee "$SMOKE_OUTPUT/probe-compile.log"
+          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
+            -framework AppKit -framework ScreenCaptureKit \
+            scripts/screenshot-startup-benchmark/cap-fixture.swift \
+            -o "$SMOKE_OUTPUT/cap-fixture" 2>&1 | tee "$SMOKE_OUTPUT/fixture-compile.log"
+      - name: Verify graphics and capture on this job's runner
+        run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$SMOKE_OUTPUT/preflight"
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 -vV > "$SMOKE_OUTPUT/rust.txt"
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          target: aarch64-apple-darwin
+          prefix-key: fork-screenshot-release-v1
+          save-cache: "true"
+          cache-on-failure: "true"
+          workspaces: apps/desktop-gpui -> target
+      - name: Prepare native libraries and GPUI dependency
+        run: |
+          node scripts/setup.js 2>&1 | tee "$SMOKE_OUTPUT/native-setup.log"
+          ./scripts/prepare-gpui-dependency.sh 2>&1 | tee "$SMOKE_OUTPUT/gpui-setup.log"
+      - name: Build instrumented baseline and revised release binaries
+        run: python3 scripts/screenshot-startup-benchmark/build-cap.py "$SMOKE_OUTPUT/builds"
+      - name: Verify capture, visible editor image, and normal editor close
+        run: python3 scripts/screenshot-startup-benchmark/run-cap-smoke.py "$SMOKE_OUTPUT"
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cap-screenshot-smoke-macos-15
+          path: |
+            ${{ runner.temp }}/cap-screenshot-smoke/**
+            !${{ runner.temp }}/cap-screenshot-smoke/builds/*/cap-gpui
+            !${{ runner.temp }}/cap-screenshot-smoke/cap-fixture
+            !${{ runner.temp }}/cap-screenshot-smoke/preflight/runner-probe
+          if-no-files-found: warn
+          retention-days: 7
