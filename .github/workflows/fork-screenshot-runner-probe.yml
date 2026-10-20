@@ -1,0 +1,56 @@
+name: Fork screenshot runner probe
+
+on:
+  push:
+    branches: [perf/screenshot-startup-benchmark]
+    paths:
+      - .github/workflows/fork-screenshot-runner-probe.yml
+      - scripts/screenshot-startup-benchmark/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-screenshot-runner-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    if: github.repository == 'dovidmoishe/Cap'
+    name: Probe ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record runner environment
+        run: |
+          PROBE_OUTPUT="$RUNNER_TEMP/screenshot-runner-probe"
+          echo "PROBE_OUTPUT=$PROBE_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$PROBE_OUTPUT"
+          sw_vers > "$PROBE_OUTPUT/os.txt"
+          uname -m >> "$PROBE_OUTPUT/os.txt"
+          xcodebuild -version >> "$PROBE_OUTPUT/os.txt"
+          printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion" >> "$PROBE_OUTPUT/os.txt"
+          system_profiler SPHardwareDataType SPDisplaysDataType -json > "$PROBE_OUTPUT/hardware.json"
+      - name: Compile capability probe
+        run: |
+          xcrun swiftc -swift-version 5 -parse-as-library -target "$(uname -m)-apple-macosx15.0" \
+            -framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit \
+            scripts/screenshot-startup-benchmark/runner-probe.swift \
+            -o "$PROBE_OUTPUT/runner-probe" 2>&1 | tee "$PROBE_OUTPUT/compile.log"
+      - name: Check visible window, Metal, and full-display capture
+        run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$PROBE_OUTPUT"
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: screenshot-runner-probe-${{ matrix.runner }}
+          path: ${{ runner.temp }}/screenshot-runner-probe/
+          if-no-files-found: warn
+          retention-days: 7
