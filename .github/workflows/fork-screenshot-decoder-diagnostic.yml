@@ -1,0 +1,68 @@
+name: Fork screenshot decoder diagnostic
+
+on:
+  push:
+    branches: [perf/screenshot-startup-benchmark]
+    paths:
+      - .github/workflows/fork-screenshot-decoder-diagnostic.yml
+      - scripts/screenshot-decoder-diagnostic/**
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: fork-screenshot-decoder-diagnostic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    if: github.repository == 'dovidmoishe/Cap'
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record environment
+        run: |
+          DIAGNOSTIC_OUTPUT="$RUNNER_TEMP/screenshot-decoder-diagnostic"
+          echo "DIAGNOSTIC_OUTPUT=$DIAGNOSTIC_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$DIAGNOSTIC_OUTPUT"
+          sw_vers > "$DIAGNOSTIC_OUTPUT/os.txt"
+          xcodebuild -version >> "$DIAGNOSTIC_OUTPUT/os.txt"
+          printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion" >> "$DIAGNOSTIC_OUTPUT/os.txt"
+      - name: Download existing failed-run evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 39415518245 --repo "$GITHUB_REPOSITORY" \
+            --name cap-screenshot-smoke-macos-15 --dir "$DIAGNOSTIC_OUTPUT/input"
+      - name: Compile only the image helpers
+        run: |
+          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
+            -framework AppKit -framework ScreenCaptureKit \
+            scripts/screenshot-startup-benchmark/cap-fixture.swift \
+            -o "$DIAGNOSTIC_OUTPUT/original-checker" 2>&1 | tee "$DIAGNOSTIC_OUTPUT/original-compile.log"
+          test -x "$DIAGNOSTIC_OUTPUT/original-checker"
+          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
+            -framework AppKit scripts/screenshot-decoder-diagnostic/inspect.swift \
+            -o "$DIAGNOSTIC_OUTPUT/inspect" 2>&1 | tee "$DIAGNOSTIC_OUTPUT/diagnostic-compile.log"
+          test -x "$DIAGNOSTIC_OUTPUT/inspect"
+      - name: Compare raw and converted colors
+        run: python3 scripts/screenshot-decoder-diagnostic/collect.py "$DIAGNOSTIC_OUTPUT"
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: screenshot-decoder-diagnostic-macos-15
+          path: |
+            ${{ runner.temp }}/screenshot-decoder-diagnostic/**
+            !${{ runner.temp }}/screenshot-decoder-diagnostic/original-checker
+            !${{ runner.temp }}/screenshot-decoder-diagnostic/inspect
+          if-no-files-found: warn
+          retention-days: 7
