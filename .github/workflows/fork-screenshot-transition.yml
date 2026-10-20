@@ -43,7 +43,7 @@ jobs:
       - name: Compile helpers without building Cap
         run: |
           xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
-            -framework AppKit -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo \
+            -framework AppKit -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework QuartzCore \
             scripts/screenshot-transition-check/recorder.swift -o "$OUTPUT/recorder" 2>&1 | tee "$OUTPUT/recorder-compile.log"
           xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
             -framework AppKit -framework ScreenCaptureKit scripts/screenshot-startup-benchmark/cap-fixture.swift \

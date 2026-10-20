@@ -46,7 +46,7 @@ class AnalysisTests(unittest.TestCase):
             name = f"frames/{index:04d}.png"
             pixels = self.pattern if index >= 9 else np.zeros_like(self.pattern)
             Image.fromarray(pixels).save(self.root / name)
-            self.report["frames"].append({"file": name, "utc": BASE + index * 0.02, "freshPixels": index in (0, 9, 18)})
+            self.report["frames"].append({"file": name, "utc": BASE + index * 0.02, "freshPixels": True, "status": 0})
 
     def test_stable_recording_produces_review_evidence_not_a_flash_free_verdict(self):
         result = analysis.transition(self.root, self.report, self.capture)
@@ -65,10 +65,42 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(result["status"], "possible-visual-discontinuity")
         self.assertEqual(result["possibleBlankFrames"], [15])
 
+    def test_repeated_idle_timestamps_do_not_count_as_new_frames(self):
+        for frame in self.report["frames"]:
+            frame.update(status=0, freshPixels=True)
+        original = analysis.transition(self.root, self.report, self.capture)
+        idle = self.report["frames"][10] | {"status": 1, "freshPixels": False}
+        self.report["frames"].insert(11, idle)
+        result = analysis.transition(self.root, self.report, self.capture)
+        self.assertEqual(result["status"], "evidence-ready-for-review")
+        self.assertEqual(result["rawPreviewSamples"], original["rawPreviewSamples"])
+        idle["file"] = "frames/0009.png"
+        with self.assertRaisesRegex(analysis.Inconclusive, "Idle notification changed"):
+            analysis.transition(self.root, self.report, self.capture)
+
+    def test_idle_notifications_cannot_fill_a_real_frame_gap(self):
+        for frame in self.report["frames"]:
+            frame.update(status=0, freshPixels=True)
+        previous = self.report["frames"][16]
+        for index in range(17, 26):
+            self.report["frames"][index].update(status=1, freshPixels=False, file=previous["file"], utc=previous["utc"])
+        with self.assertRaisesRegex(analysis.Inconclusive, "sampling gap"):
+            analysis.transition(self.root, self.report, self.capture)
+
+    def test_heartbeat_must_be_visible_and_outside_editor(self):
+        self.report["geometry"].update(heartbeatRect=[0, 0, 8, 8], observedHeartbeatValues=3)
+        self.assertEqual(analysis.transition(self.root, self.report, self.capture)["status"], "evidence-ready-for-review")
+        self.report["geometry"]["heartbeatRect"] = [8, 8, 8, 8]
+        with self.assertRaisesRegex(analysis.Inconclusive, "overlaps"):
+            analysis.transition(self.root, self.report, self.capture)
+        self.report["geometry"].update(heartbeatRect=[0, 0, 8, 8], observedHeartbeatValues=0)
+        with self.assertRaisesRegex(analysis.Inconclusive, "not observed"):
+            analysis.transition(self.root, self.report, self.capture)
+
     def test_long_gpu_initialization_keeps_early_preview_evidence(self):
         self.capture["diagnosticGPU"]["utc"] = "2026-10-20T00:00:04.650Z"
         for index in range(60, 280):
-            self.report["frames"].append({"file": "frames/0059.png", "utc": BASE + index * 0.02, "freshPixels": False})
+            self.report["frames"].append({"file": "frames/0059.png", "utc": BASE + index * 0.02, "freshPixels": True, "status": 0})
         self.report["stream"]["evictedEvents"] = 0
         result = analysis.transition(self.root, self.report, self.capture)
         self.assertEqual(result["status"], "evidence-ready-for-review")
@@ -82,9 +114,9 @@ class AnalysisTests(unittest.TestCase):
     def test_small_color_changes_are_reported_for_manual_review(self):
         changed = self.pattern.copy()
         changed[12:20, 12:20, 0] -= 1
-        Image.fromarray(changed).save(self.root / "frames/0010.png")
+        Image.fromarray(changed).save(self.root / "frames/0014.png")
         result = analysis.transition(self.root, self.report, self.capture)
-        frame = next(frame for frame in result["frames"] if frame["frame"] == 10)
+        frame = next(frame for frame in result["frames"] if frame["frame"] == 14)
         self.assertEqual(frame["wholeWindowChangedPixels"], 64)
         self.assertEqual(frame["wholeWindowMaxChannelDifference"], 1)
         self.assertTrue(result["manualVisualReviewRequired"])

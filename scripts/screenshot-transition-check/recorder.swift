@@ -2,6 +2,7 @@ import AppKit
 import CoreMedia
 import CoreVideo
 import Darwin
+import QuartzCore
 import ScreenCaptureKit
 
 func writeJSON(_ value: [String: Any], to path: URL) throws {
@@ -192,6 +193,10 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
     private let store: FrameStore
     private var stream: SCStream?
     private var window: NSPanel?
+    private var heartbeat: NSPanel?
+    private var heartbeatTimer: Timer?
+    private var heartbeatSequence = 0
+    private var observedHeartbeatValues: Set<Int> = []
     private var middle: NSView?
     private var timer: Timer?
     private var readyAt: Double?
@@ -257,6 +262,26 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
         }
         window = panel
         panel.orderFrontRegardless()
+        let marker = NSPanel(contentRect: NSRect(x: screen.frame.minX, y: screen.frame.maxY - 8, width: 8, height: 8),
+                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        marker.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+        marker.hidesOnDeactivate = false
+        marker.hasShadow = false
+        marker.ignoresMouseEvents = true
+        marker.isReleasedWhenClosed = false
+        marker.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        marker.contentView?.wantsLayer = true
+        marker.orderFrontRegardless()
+        heartbeat = marker
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [self] _ in
+            MainActor.assumeIsolated {
+                heartbeatSequence += 1
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                marker.contentView?.layer?.backgroundColor = CGColor(gray: CGFloat(heartbeatSequence % 251) / 250, alpha: 1)
+                CATransaction.commit()
+            }
+        }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
             throw NSError(domain: "transition-display-missing", code: 1)
@@ -273,6 +298,7 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
         configuration.capturesAudio = false
         geometry = ["width": configuration.width, "height": configuration.height, "scale": screen.backingScaleFactor,
                     "displayOriginX": CGDisplayBounds(displayID).origin.x, "displayOriginY": CGDisplayBounds(displayID).origin.y,
+                    "heartbeatRect": [0, 0, 8, 8], "heartbeatWindowNumber": marker.windowNumber,
                     "backgroundWindowNumber": panel.windowNumber, "backgroundLevel": panel.level.rawValue]
         let stream = SCStream(filter: filter, configuration: configuration, delegate: store)
         self.stream = stream
@@ -288,10 +314,17 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
         let now = Date().timeIntervalSince1970
         do {
             if readyAt == nil, let frame = store.latest(), frame.patternVisible() {
-                readyAt = now
-                phaseEvents.append(["name": "blue", "utc": now])
-                try writeJSON(["utc": now, "pid": getpid(), "geometry": geometry, "patternVisible": true],
-                              to: output.appendingPathComponent("ready.json"))
+                let sample = frame.rgb(4, 4)
+                if sample.count == 3 && abs(sample[0] - sample[1]) < 0.02 && abs(sample[1] - sample[2]) < 0.02 {
+                    observedHeartbeatValues.insert(Int((sample[0] * 255).rounded()))
+                }
+                if observedHeartbeatValues.count >= 3 {
+                    geometry["observedHeartbeatValues"] = observedHeartbeatValues.count
+                    readyAt = now
+                    phaseEvents.append(["name": "blue", "utc": now])
+                    try writeJSON(["utc": now, "pid": getpid(), "geometry": geometry, "patternVisible": true],
+                                  to: output.appendingPathComponent("ready.json"))
+                }
             }
             if selfTest, let readyAt {
                 if phase == 0 && now - readyAt > 0.3 {
@@ -344,6 +377,7 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
         guard !finishing else { return }
         finishing = true
         timer?.invalidate()
+        heartbeatTimer?.invalidate()
         Task { @MainActor in
             var failure = error
             if let stream {
@@ -386,6 +420,7 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
                 exit(2)
             }
             window?.orderOut(nil)
+            heartbeat?.orderOut(nil)
             exit(failure == nil ? 0 : 1)
         }
     }

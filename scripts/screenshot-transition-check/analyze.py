@@ -26,7 +26,18 @@ def load_frames(root, report):
         raise Inconclusive(f"Recorder did not finish cleanly: {report.get('error', report.get('stream', {}).get('errors'))}")
     if report.get("stream", {}).get("evictedEvents", 0):
         raise Inconclusive("Recorder discarded frames; full transition history is unavailable")
-    frames = report.get("frames", [])
+    events = report.get("frames", [])
+    frames = []
+    previous = None
+    for event in events:
+        if event.get("status") == 0 and event.get("freshPixels") is True:
+            frames.append(event)
+            previous = event
+        elif event.get("status") == 1 and event.get("freshPixels") is False and previous is not None:
+            if event.get("file") != previous.get("file"):
+                raise Inconclusive("Idle notification changed stored pixels")
+        else:
+            raise Inconclusive("Unexpected frame status or idle notification without preceding pixels")
     if len(frames) < 3 or any(not finite(frame.get("utc")) for frame in frames):
         raise Inconclusive("Not enough timestamped recorder frames")
     if any(second["utc"] <= first["utc"] for first, second in zip(frames, frames[1:])):
@@ -123,11 +134,20 @@ def transition(root, report, capture):
     if capture["diagnosticPreview"]["bounds"] != capture["diagnosticGPU"]["bounds"]:
         raise Inconclusive("Software preview and GPU image bounds differ")
     rect = editor_rect(report, capture, preview, gpu + 0.6)
+    heartbeat = report.get("geometry", {}).get("heartbeatRect")
+    if heartbeat is not None:
+        if len(heartbeat) != 4 or not all(finite(value) for value in heartbeat):
+            raise Inconclusive("Invalid recorder heartbeat geometry")
+        hx, hy, hw, hh = heartbeat
+        if report["geometry"].get("observedHeartbeatValues", 0) < 3:
+            raise Inconclusive("Recorder heartbeat was not observed changing in captured pixels")
+        if hw <= 0 or hh <= 0 or hx < rect[2] and hx + hw > rect[0] and hy < rect[3] and hy + hh > rect[1]:
+            raise Inconclusive("Recorder heartbeat overlaps the editor window")
     x0, y0, x1, y1 = rect
     crops = [image[y0:y1, x0:x1] for image in images]
     ratios = [color_present(crop) for crop in crops]
     has_pattern = [all(value > 0.05 for value in row) for row in ratios]
-    before = [index for index, frame in enumerate(frames) if started < frame["utc"] <= min(preview + 0.02, gpu - 0.025) and has_pattern[index]]
+    before = [index for index, frame in enumerate(frames) if preview + 0.02 <= frame["utc"] <= gpu - 0.025 and has_pattern[index]]
     after = [index for index, frame in enumerate(frames) if gpu + 0.05 <= frame["utc"] <= gpu + 0.6 and has_pattern[index]]
     if len(before) < 2 or len(after) < 2:
         raise Inconclusive("Recording missed enough visible raw-preview or post-GPU samples; no flash-free claim")
@@ -184,7 +204,7 @@ def main():
     try:
         if args.capture:
             capture = json.loads((args.capture / "result.json").read_text())
-            capture["log"] = (args.capture / "cap.log").read_text()
+            capture["log"] = (args.capture / "cap.log").read_text(errors="replace")
             result = transition(root, report, capture)
         else:
             result = self_test(root, report)
