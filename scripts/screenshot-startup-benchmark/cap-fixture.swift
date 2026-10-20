@@ -44,6 +44,7 @@ func imageEvidence(_ bitmap: NSBitmapImageRep) -> [String: Any] {
         return [Double(color.redComponent), Double(color.greenComponent), Double(color.blueComponent)]
     }
     return ["width": bitmap.pixelsWide, "height": bitmap.pixelsHigh, "sampleRGB": centers,
+            "rawRGBInspectable": centers.allSatisfy { $0.count == 3 },
             "validationSpace": "stored opaque 8-bit RGB samples", "convertedDeviceRGB": converted,
             "colorRatios": ratios, "fixtureMatches": fixtureMatches,
             "containsFixtureColors": ratios.allSatisfy { $0 > 0.05 }]
@@ -93,24 +94,56 @@ func writeJSON(_ value: [String: Any], to path: URL) throws {
 
 @MainActor
 final class Fixture: NSObject, NSApplicationDelegate {
+    enum Mode: Equatable { case colored, desktop, testWindow }
     let directory: URL
+    let mode: Mode
     private var window: NSWindow?
     private var timer: Timer?
     private var hidden = false
     private var recording = false
+    private var hiddenSince: TimeInterval?
+    private var mainWindowObserved = false
+    private var resumed = false
 
-    init(directory: URL) {
+    init(directory: URL, mode: Mode = .colored) {
         self.directory = directory
+        self.mode = mode
+    }
+
+    private func ownedWindows(_ pid: Int32) throws -> [[String: Any]] {
+        guard let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
+            throw NSError(domain: "window-list", code: 1)
+        }
+        return windows.filter { ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid }
+    }
+
+    private func utc() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: Date())
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let screen = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == CGMainDisplayID()
         }) else { exit(2) }
+        if mode == .desktop {
+            do {
+                try writeJSON(["mode": "desktop", "pixelWidth": CGDisplayPixelsWide(CGMainDisplayID()),
+                               "pixelHeight": CGDisplayPixelsHigh(CGMainDisplayID()),
+                               "activeDisplay": CGDisplayIsActive(CGMainDisplayID()) != 0 && CGDisplayIsAsleep(CGMainDisplayID()) == 0,
+                               "helperWindowCount": ownedWindows(getpid()).count],
+                              to: directory.appendingPathComponent("fixture-ready.json"))
+            } catch { fail(error) }
+            timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [self] _ in
+                MainActor.assumeIsolated { prepareDesktop() }
+            }
+            return
+        }
         let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
         self.window = window
         let fixtureLevelAboveCapMainPanel = NSWindow.Level(rawValue: 101)
-        window.level = fixtureLevelAboveCapMainPanel
+        window.level = mode == .testWindow ? NSWindow.Level(rawValue: 100) : fixtureLevelAboveCapMainPanel
         window.title = "Cap fixed screenshot fixture"
         window.isReleasedWhenClosed = false
         let root = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
@@ -145,7 +178,52 @@ final class Fixture: NSObject, NSApplicationDelegate {
         exit(2)
     }
 
+    private func prepareDesktop() {
+        let request = directory.appendingPathComponent("cap-pid")
+        guard !hidden, FileManager.default.fileExists(atPath: request.path) else { return }
+        do {
+            guard let pid = Int32(try String(contentsOf: request, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)),
+                  pid != getpid() else { throw NSError(domain: "cap-pid", code: 1) }
+            guard let application = NSRunningApplication(processIdentifier: pid) else { return }
+            let mainWindows = try ownedWindows(pid).filter { ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 100 }
+            if !mainWindows.isEmpty { mainWindowObserved = true }
+            guard mainWindowObserved else { return }
+            if !application.isHidden {
+                hiddenSince = nil
+                guard application.hide() else { throw NSError(domain: "application-hide", code: 2) }
+                return
+            }
+            guard mainWindows.isEmpty else { hiddenSince = nil; return }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard let since = hiddenSince else { hiddenSince = now; return }
+            guard now - since >= 0.25 else { return }
+            try writeJSON(["ownerPID": pid, "hidden": true, "hiddenUTC": utc(),
+                           "visibleMainWindows": mainWindows.count, "mainWindowLevel": 100,
+                           "stableHiddenMs": (now - since) * 1000],
+                          to: directory.appendingPathComponent("desktop-hidden.json"))
+            hidden = true
+            timer?.invalidate()
+        } catch { fail(error) }
+    }
+
     private func poll() {
+        if mode == .testWindow && !resumed && FileManager.default.fileExists(atPath: directory.appendingPathComponent("unhide-request").path) {
+            resumed = true
+            window?.orderOut(nil)
+            let editor = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 400, height: 300),
+                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            window = editor
+            editor.title = "Cap desktop setup stand-in editor"
+            editor.isReleasedWhenClosed = false
+            editor.makeKeyAndOrderFront(nil)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+                do {
+                    try writeJSON(["hidden": NSApplication.shared.isHidden, "visible": window?.isVisible == true],
+                                  to: directory.appendingPathComponent("resumed.json"))
+                } catch { fail(error) }
+            }
+        }
         if !hidden && FileManager.default.fileExists(atPath: directory.appendingPathComponent("capture-saved").path) {
             window?.orderOut(nil)
             hidden = true
@@ -220,10 +298,11 @@ struct Main {
             print(text)
             return
         }
-        guard CommandLine.arguments[1] == "--run" else { exit(2) }
+        let modes: [String: Fixture.Mode] = ["--run": .colored, "--run-desktop": .desktop, "--test-window": .testWindow]
+        guard let mode = modes[CommandLine.arguments[1]] else { exit(2) }
         let application = NSApplication.shared
-        application.setActivationPolicy(.regular)
-        let delegate = Fixture(directory: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true))
+        application.setActivationPolicy(mode == .desktop ? .prohibited : .regular)
+        let delegate = Fixture(directory: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true), mode: mode)
         application.delegate = delegate
         withExtendedLifetime(delegate) { application.run() }
     }

@@ -40,7 +40,26 @@ def inspect_image(fixture, path, output):
     return json.loads(result.stdout)
 
 
-def run_variant(package, output, fixture, binary, *, capture_editor=True):
+def validate_desktop_preparation(directory, pid, log):
+    hidden = json.loads((directory / "desktop-hidden.json").read_text())
+    capture = re.search(r"^(\S+) .*CAP_BENCH_CAPTURE\s*$", log, re.MULTILINE)
+    if not capture:
+        raise RuntimeError("Capture start timestamp missing")
+    if hidden.get("ownerPID") != pid or hidden.get("hidden") is not True or hidden.get("visibleMainWindows") != 0:
+        raise RuntimeError("Desktop preparation did not verify the owned Cap main window was hidden")
+    if hidden.get("mainWindowLevel") != 100 or hidden.get("stableHiddenMs", 0) < 250:
+        raise RuntimeError("Desktop preparation did not verify a stable hidden main panel")
+    started = datetime.fromisoformat(capture[1].replace("Z", "+00:00"))
+    completed = datetime.fromisoformat(hidden["hiddenUTC"].replace("Z", "+00:00"))
+    margin = (started - completed).total_seconds() * 1000
+    if margin < 250:
+        raise RuntimeError(f"Cap was not hidden at least 250ms before capture started: {margin:.1f}ms")
+    return {"evidence": hidden, "hiddenBeforeCaptureMs": margin}
+
+
+def run_variant(package, output, fixture, binary, *, capture_editor=True, desktop=False):
+    if desktop and capture_editor:
+        raise ValueError("Desktop timing mode requires editor image recording to be disabled")
     directory = output / binary["variant"]
     directory.mkdir()
     profile = directory / "profile"
@@ -68,17 +87,21 @@ def run_variant(package, output, fixture, binary, *, capture_editor=True):
         raise ValueError("Executable hash differs from build provenance")
     child = None
     scene = None
-    record = {"variant": binary["variant"], "passed": False, "editorImageRecording": capture_editor}
+    record = {"variant": binary["variant"], "passed": False, "editorImageRecording": capture_editor,
+              "inputMode": "desktop" if desktop else "colored-fixture"}
     try:
         with (directory / "fixture.log").open("w") as fixture_log, (directory / "cap.log").open("w") as cap_log:
-            scene = subprocess.Popen([str(fixture), "--run", str(directory)], stdout=fixture_log, stderr=subprocess.STDOUT)
+            scene = subprocess.Popen([str(fixture), "--run-desktop" if desktop else "--run", str(directory)], stdout=fixture_log, stderr=subprocess.STDOUT)
             deadline = time.monotonic() + 15
             while not (directory / "fixture-ready.json").exists():
                 if scene.poll() is not None or time.monotonic() > deadline:
                     raise RuntimeError("Fixed display fixture did not become ready")
                 time.sleep(0.05)
             ready = json.loads((directory / "fixture-ready.json").read_text())
-            if ready.get("visible") is not True:
+            if desktop:
+                if ready.get("mode") != "desktop" or ready.get("activeDisplay") is not True or ready.get("helperWindowCount") != 0:
+                    raise RuntimeError("Desktop helper did not verify an active display without helper windows")
+            elif ready.get("visible") is not True:
                 raise RuntimeError("Fixture is not visible")
             child = subprocess.Popen(
                 [str(executable)], cwd=package, env=environment,
@@ -87,8 +110,18 @@ def run_variant(package, output, fixture, binary, *, capture_editor=True):
             record["ownedPID"] = child.pid
             deadline = time.monotonic() + 90
             requested = False
+            main_seen = None
+            desktop_requested = False
             while True:
                 log = ANSI.sub("", (directory / "cap.log").read_text(errors="replace"))
+                if desktop and not desktop_requested and "main window opened" in log:
+                    if main_seen is None:
+                        main_seen = time.monotonic()
+                    if time.monotonic() - main_seen >= 0.4:
+                        pending = directory / "cap-pid.pending"
+                        pending.write_text(str(child.pid))
+                        pending.replace(directory / "cap-pid")
+                        desktop_requested = True
                 preview = draw(log, "preview")
                 gpu = draw(log, "gpu")
                 closed = "screenshot editor window closed" in log
@@ -106,12 +139,19 @@ def run_variant(package, output, fixture, binary, *, capture_editor=True):
                 time.sleep(0.05)
             if not (directory / "capture-saved").exists():
                 raise RuntimeError("Capture completion signal missing")
-            hidden = json.loads((directory / "fixture-hidden.json").read_text())
-            preview_time = datetime.fromisoformat(preview["utc"].replace("Z", "+00:00"))
-            hidden_time = datetime.fromisoformat(hidden["hiddenUTC"].replace("Z", "+00:00"))
-            exposure_margin = (preview_time - hidden_time).total_seconds() * 1000
-            if exposure_margin < 25:
-                raise RuntimeError(f"Fixture hidden too late to verify visible image draw: {exposure_margin:.1f}ms margin")
+            record.update({"diagnosticPreview": preview, "diagnosticGPU": gpu, "normalEditorCloseObserved": True})
+            if desktop:
+                if not desktop_requested:
+                    raise RuntimeError("Desktop preparation was not requested before the capture completed")
+                record["desktopPreparation"] = validate_desktop_preparation(directory, child.pid, log)
+            else:
+                hidden = json.loads((directory / "fixture-hidden.json").read_text())
+                preview_time = datetime.fromisoformat(preview["utc"].replace("Z", "+00:00"))
+                hidden_time = datetime.fromisoformat(hidden["hiddenUTC"].replace("Z", "+00:00"))
+                exposure_margin = (preview_time - hidden_time).total_seconds() * 1000
+                record["fixtureHiddenBeforePreviewMs"] = exposure_margin
+                if exposure_margin < 25:
+                    raise RuntimeError(f"Fixture hidden too late to verify visible image draw: {exposure_margin:.1f}ms margin")
             captures = list(profile.glob("screenshots/*/original.png"))
             if len(captures) != 1:
                 raise RuntimeError(f"Expected one saved PNG, found {len(captures)}")
@@ -119,7 +159,10 @@ def run_variant(package, output, fixture, binary, *, capture_editor=True):
             image = inspect_image(fixture, capture, directory)
             record.update({"input": image, "inputPNG": capture.relative_to(output).as_posix(),
                            "inputPNGsha256": hashlib.sha256(capture.read_bytes()).hexdigest()})
-            if image.get("fixtureMatches") is not True or image.get("containsFixtureColors") is not True:
+            if desktop:
+                if image.get("rawRGBInspectable") is not True:
+                    raise RuntimeError("Desktop screenshot cannot be inspected as opaque RGB pixels")
+            elif image.get("fixtureMatches") is not True or image.get("containsFixtureColors") is not True:
                 raise RuntimeError("Saved screenshot does not contain the fixed full-display scene")
             if (image["width"], image["height"]) != (ready["pixelWidth"], ready["pixelHeight"]):
                 raise RuntimeError("Saved screenshot dimensions differ from the fixture display")
@@ -135,7 +178,6 @@ def run_variant(package, output, fixture, binary, *, capture_editor=True):
                 "passed": True,
                 "diagnosticPreview": preview,
                 "diagnosticGPU": gpu,
-                "fixtureHiddenBeforePreviewMs": exposure_margin,
                 "input": image,
                 "inputPNGsha256": hashlib.sha256(capture.read_bytes()).hexdigest(),
                 "editor": editor,

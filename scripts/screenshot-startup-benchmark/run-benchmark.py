@@ -24,6 +24,11 @@ def schedule(samples, warmups):
 def validate_capture(record):
     if not record.get("passed") or record.get("editorImageRecording") is not False:
         raise ValueError(f"Invalid timed capture: {record.get('error', 'capture failed or editor recording enabled')}")
+    if record.get("inputMode") != "desktop":
+        raise ValueError("Timed samples must use the unobscured desktop, not an overlaid fixture")
+    margin = record.get("desktopPreparation", {}).get("hiddenBeforeCaptureMs", 0)
+    if not math.isfinite(margin) or margin < 250:
+        raise ValueError("Desktop preparation did not complete sufficiently before capture entry")
     preview = record["diagnosticPreview"]["elapsed_ms"]
     gpu = record["diagnosticGPU"]["elapsed_ms"]
     if not all(math.isfinite(value) and value > 0 for value in [preview, gpu]) or gpu < preview:
@@ -83,9 +88,23 @@ def collect(package, output, fixture, metadata, *, samples=12, warmups=2):
     report = {"passed": False, "measuredSamplesPerVariant": samples, "excludedWarmupsPerVariant": warmups,
               "conditions": "fresh Cap process/profile per capture; warmed filesystem and driver caches",
               "editorImageRecording": False, "physicalScanoutMeasured": False,
+              "inputMode": "desktop; Cap main window hidden before capture entry; no helper windows",
               "excludedInputBorderPixels": 16, "outlierRemoval": "none", "results": None, "samples": records}
     binaries = {binary["variant"]: binary for binary in metadata["binaries"]}
     started = time.monotonic()
+    comparisons = output / "input-comparisons"
+    comparisons.mkdir()
+
+    def validate_inputs(candidates):
+        reference = output / records[0]["inputPNG"]
+        for index, record in candidates:
+            if time.monotonic() - started > 900:
+                raise TimeoutError("Benchmark exceeded its 15-minute collection/validation deadline")
+            record["inputComparison"] = compare_inputs(
+                fixture, reference, output / record["inputPNG"], comparisons / f"sample-{index:02d}",
+            )
+            (output / "partial-results.json").write_text(json.dumps(report, indent=2))
+
     try:
         for phase, pair, order in schedule(samples, warmups):
             directory = output / f"{phase}-{pair + 1:02d}"
@@ -93,23 +112,16 @@ def collect(package, output, fixture, metadata, *, samples=12, warmups=2):
             for position, variant in enumerate(order):
                 if time.monotonic() - started > 900:
                     raise TimeoutError("Benchmark exceeded its 15-minute collection deadline")
-                record = smoke.run_variant(package, directory, fixture, binaries[variant], capture_editor=False)
+                record = smoke.run_variant(package, directory, fixture, binaries[variant], capture_editor=False, desktop=True)
                 record.update({"phase": phase, "pair": pair, "positionWithinPair": position})
                 if "inputPNG" in record:
                     record["inputPNG"] = (directory / record["inputPNG"]).relative_to(output).as_posix()
                 records.append(record)
                 (output / "partial-results.json").write_text(json.dumps(report, indent=2))
                 validate_capture(record)
-        comparisons = output / "input-comparisons"
-        comparisons.mkdir()
-        reference = output / records[0]["inputPNG"]
-        for index, record in enumerate(records):
-            if time.monotonic() - started > 900:
-                raise TimeoutError("Benchmark exceeded its 15-minute collection/validation deadline")
-            record["inputComparison"] = compare_inputs(
-                fixture, reference, output / record["inputPNG"], comparisons / f"sample-{index:02d}",
-            )
-            (output / "partial-results.json").write_text(json.dumps(report, indent=2))
+            if phase == "warmup" and pair == warmups - 1:
+                validate_inputs(enumerate(records))
+        validate_inputs((index, record) for index, record in enumerate(records) if record["phase"] == "measure")
         report["results"] = summarize(records, samples)
         report["passed"] = True
     except Exception as error:
@@ -142,14 +154,16 @@ def render_report(report, provenance):
         "Each capture starts a fresh process and isolated profile. Filesystem/driver caches are warm; "
         "the graphics probe and one smoke capture per variant also precede these warmups on the same runner.",
         "This is neither cold-machine startup nor repeated editor opens within one process.", "",
-        "The full-display input is a fixed three-color scene. The timer starts at take_screenshot entry, "
+        "The input is the full desktop, with Cap's main window hidden at least 250ms before capture entry. "
+        "The helper creates no windows and stops hiding once setup is acknowledged. The timer starts at take_screenshot entry, "
         "before settings/device preparation and screenshot capture preparation. Endpoints are the first visible image paint followed "
         "by a GPUI frame callback, and the first GPU-result paint followed by that callback. "
         "They do not measure physical scanout. The baseline's first image is already GPU-rendered.",
         "Screenshot startup experiments are absent from the environment. Editor-window image recording "
         "and verbose dynamic-loader logging are disabled for warmup and measured samples. "
-        "The fixture, capture IPC, draw hooks, and log polling remain enabled in both variants.",
-        "Saved-PNG inspection runs after editor close; all cross-sample comparisons run after timing collection.", "",
+        "Capture IPC, draw hooks, and log polling remain enabled in both variants. The colored fixture is used only for smoke.",
+        "Saved-PNG inspection runs after editor close. Warmup inputs must match before measured collection starts; "
+        "measured inputs are compared after timing collection.", "",
         "Inputs must match the reference exactly after excluding a fixed 16-pixel border on all four sides. "
         "Full PNGs and individual border differences are retained. The excluded edges are not validated for equality.",
         "This run does not establish a flash-free preview handoff or performance on consumer Mac hardware.", "",

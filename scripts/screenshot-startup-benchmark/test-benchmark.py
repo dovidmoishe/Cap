@@ -19,6 +19,7 @@ spec.loader.exec_module(benchmark)
 
 def capture(variant, preview=100, gpu=200):
     return {"variant": variant, "passed": True, "editorImageRecording": False,
+            "inputMode": "desktop", "desktopPreparation": {"hiddenBeforeCaptureMs": 1000},
             "diagnosticPreview": {"elapsed_ms": preview}, "diagnosticGPU": {"elapsed_ms": gpu},
             "inputPNG": f"{variant}/original.png"}
 
@@ -76,8 +77,9 @@ class CollectionTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.metadata = {"binaries": [{"variant": "baseline"}, {"variant": "revised"}]}
 
-    def fake_capture(self, package, output, fixture, binary, *, capture_editor):
+    def fake_capture(self, package, output, fixture, binary, *, capture_editor, desktop):
         self.assertFalse(capture_editor)
+        self.assertTrue(desktop)
         record = capture(binary["variant"])
         path = output / record["inputPNG"]
         path.parent.mkdir()
@@ -115,15 +117,25 @@ class CollectionTests(unittest.TestCase):
 
     def test_input_mismatch_invalidates_all_performance_results(self):
         with patch.object(benchmark.smoke, "run_variant", side_effect=self.fake_capture), patch.object(
-            benchmark.subprocess, "run", return_value=self.comparison(False),
+            benchmark.subprocess, "run", side_effect=[self.comparison()] * 4 + [self.comparison(False)],
         ):
             report = benchmark.collect(self.root, self.root / "timings", self.root / "fixture", self.metadata)
         self.assertFalse(report["passed"])
         self.assertIsNone(report["results"])
         self.assertEqual(len(report["samples"]), 28)
-        saved = json.loads((self.root / "timings/input-comparisons/sample-00.json").read_text())
+        saved = json.loads((self.root / "timings/input-comparisons/sample-04.json").read_text())
         self.assertEqual(saved["interiorDifferentPixels"], 1)
         self.assertEqual(len(saved["exteriorDifferences"]), 1)
+
+    def test_unstable_desktop_blocks_measured_collection(self):
+        with patch.object(benchmark.smoke, "run_variant", side_effect=self.fake_capture) as run, patch.object(
+            benchmark.subprocess, "run", return_value=self.comparison(False),
+        ):
+            report = benchmark.collect(self.root, self.root / "timings", self.root / "fixture", self.metadata)
+        self.assertFalse(report["passed"])
+        self.assertIsNone(report["results"])
+        self.assertEqual(run.call_count, 4)
+        self.assertTrue(all(record["phase"] == "warmup" for record in report["samples"]))
 
     def test_comparison_failure_preserves_stdout_and_stderr(self):
         result = subprocess.CompletedProcess([], 2, "partial", "decode failed")
@@ -133,6 +145,59 @@ class CollectionTests(unittest.TestCase):
 
 
 class CaptureModeTests(unittest.TestCase):
+    def test_desktop_mode_hides_before_capture_without_overlay_or_color_requirement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir()
+            directory = output / "baseline"
+            executable = root / "cap-gpui"
+            executable.write_bytes(b"fake executable")
+            binary = {"variant": "baseline", "executable": "cap-gpui", "sha256": hashlib.sha256(executable.read_bytes()).hexdigest()}
+            child = Mock(pid=42)
+            child.poll.return_value = None
+            clock = [0.0]
+
+            def launch(command, **kwargs):
+                if "--run-desktop" in command:
+                    (directory / "fixture-ready.json").write_text(json.dumps({"mode": "desktop", "activeDisplay": True,
+                        "helperWindowCount": 0, "pixelWidth": 96, "pixelHeight": 64}))
+                else:
+                    self.assertNotIn("DYLD_PRINT_LIBRARIES", kwargs["env"])
+                    kwargs["stdout"].write("main window opened\n")
+                    kwargs["stdout"].flush()
+                return child
+
+            def tick(delay):
+                clock[0] += delay
+                if (directory / "cap-pid").exists() and not (directory / "capture-saved").exists():
+                    self.assertEqual((directory / "cap-pid").read_text(), "42")
+                    (directory / "desktop-hidden.json").write_text(json.dumps({"ownerPID": 42, "hidden": True,
+                        "visibleMainWindows": 0, "mainWindowLevel": 100, "stableHiddenMs": 300,
+                        "hiddenUTC": "2026-10-20T00:00:00Z"}))
+                    (directory / "cap.log").write_text('main window opened\n'
+                        '2026-10-20T00:00:01Z INFO CAP_BENCH_CAPTURE\n'
+                        '2026-10-20T00:00:01.001Z INFO CAP_BENCH_DRAW kind="preview" elapsed_ms=1 bounds=same\n'
+                        '2026-10-20T00:00:01.030Z INFO CAP_BENCH_DRAW kind="gpu" elapsed_ms=30 bounds=same\n'
+                        'screenshot editor window closed\n')
+                    (directory / "capture-saved").write_text("ready")
+                    path = directory / "profile/screenshots/test/original.png"
+                    path.parent.mkdir(parents=True)
+                    path.write_bytes(b"desktop")
+
+            image = {"fixtureMatches": False, "containsFixtureColors": False, "rawRGBInspectable": True, "width": 96, "height": 64}
+            with patch.object(benchmark.smoke.subprocess, "Popen", side_effect=launch), patch.object(
+                benchmark.smoke, "inspect_image", return_value=image,
+            ), patch.object(benchmark.smoke, "terminate"), patch.object(benchmark.smoke.time, "sleep", side_effect=tick), patch.object(
+                benchmark.smoke.time, "monotonic", side_effect=lambda: clock[0],
+            ), contextlib.redirect_stdout(io.StringIO()):
+                record = benchmark.smoke.run_variant(root, output, root / "fixture", binary, capture_editor=False, desktop=True)
+            self.assertTrue(record["passed"], record.get("error"))
+            self.assertEqual(record["desktopPreparation"]["hiddenBeforeCaptureMs"], 1000)
+            self.assertEqual(record["inputMode"], "desktop")
+            self.assertFalse((directory / "editor-pid").exists())
+            self.assertFalse((directory / "fixture-hidden.json").exists())
+
     def test_timing_mode_disables_recording_and_loader_logging_without_changing_smoke_default(self):
         for recording in [False, True]:
             with self.subTest(recording=recording), tempfile.TemporaryDirectory() as temporary:
@@ -172,6 +237,28 @@ class CaptureModeTests(unittest.TestCase):
                 self.assertTrue(record["passed"], record.get("error"))
                 self.assertEqual((output / "baseline/editor-pid").exists(), recording)
                 self.assertEqual(record["editorImageRecording"], recording)
+
+
+class DesktopPreparationTests(unittest.TestCase):
+    def test_missing_or_late_hiding_cannot_be_counted_as_valid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            evidence = {"ownerPID": 42, "hidden": True, "visibleMainWindows": 0,
+                        "mainWindowLevel": 100, "stableHiddenMs": 300, "hiddenUTC": "2026-10-20T00:00:00Z"}
+            log = "2026-10-20T00:00:01Z INFO CAP_BENCH_CAPTURE\n"
+            cases = [{"ownerPID": 99}, {"hidden": False}, {"visibleMainWindows": 1}, {"mainWindowLevel": 0},
+                     {"stableHiddenMs": 100}, {"hiddenUTC": "2026-10-20T00:00:00.900Z"},
+                     {"hiddenUTC": "2026-10-20T00:00:01.100Z"}]
+            for changes in cases:
+                with self.subTest(changes=changes):
+                    (directory / "desktop-hidden.json").write_text(json.dumps(evidence | changes))
+                    with self.assertRaises(RuntimeError):
+                        benchmark.smoke.validate_desktop_preparation(directory, 42, log)
+            (directory / "desktop-hidden.json").write_text(json.dumps(evidence))
+            with self.assertRaisesRegex(RuntimeError, "timestamp"):
+                benchmark.smoke.validate_desktop_preparation(directory, 42, "no capture event")
+            result = benchmark.smoke.validate_desktop_preparation(directory, 42, log)
+            self.assertEqual(result["hiddenBeforeCaptureMs"], 1000)
 
 
 if __name__ == "__main__":

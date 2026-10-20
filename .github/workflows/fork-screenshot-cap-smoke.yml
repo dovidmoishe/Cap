@@ -77,6 +77,10 @@ jobs:
           python3 scripts/screenshot-startup-benchmark/test-benchmark.py
       - name: Verify graphics before allowing a Cap build
         run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$RUNNER_TEMP/image-validation"
+      - name: Verify native desktop preparation without Cap
+        run: |
+          python3 scripts/screenshot-startup-benchmark/test-desktop-setup.py \
+            "$RUNNER_TEMP/image-validation/cap-fixture" "$RUNNER_TEMP/image-validation/desktop-setup"
       - name: Upload validator evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -204,6 +208,10 @@ jobs:
           test -x "$SMOKE_OUTPUT/cap-fixture"
       - name: Verify graphics and capture on this fresh test runner
         run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$SMOKE_OUTPUT/preflight"
+      - name: Verify windowless desktop preparation on this runner
+        run: |
+          python3 scripts/screenshot-startup-benchmark/test-desktop-setup.py \
+            "$SMOKE_OUTPUT/cap-fixture" "$SMOKE_OUTPUT/desktop-setup"
       - name: Launch extracted binaries and verify screenshot editor
         run: |
           python3 scripts/screenshot-startup-benchmark/run-cap-smoke.py "$SMOKE_OUTPUT" \
