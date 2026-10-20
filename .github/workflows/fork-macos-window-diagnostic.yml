@@ -1,0 +1,53 @@
+name: Fork macOS window diagnostic
+
+on:
+  push:
+    branches: [perf/screenshot-startup-benchmark]
+    paths:
+      - .github/workflows/fork-macos-window-diagnostic.yml
+      - scripts/macos-window-diagnostic/**
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: fork-macos-window-diagnostic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    if: github.repository == 'dovidmoishe/Cap'
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Compile native window diagnostic
+        run: |
+          mkdir -p "$RUNNER_TEMP/window-diagnostic"
+          python3 scripts/macos-window-diagnostic/test-run.py
+          sw_vers > "$RUNNER_TEMP/window-diagnostic/os.txt"
+          xcodebuild -version >> "$RUNNER_TEMP/window-diagnostic/os.txt"
+          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
+            -framework AppKit scripts/macos-window-diagnostic/window-probe.swift \
+            -o "$RUNNER_TEMP/window-diagnostic/WindowProbe" 2>&1 | tee "$RUNNER_TEMP/window-diagnostic/compile.log"
+      - name: Diagnose hiding and reopening without Cap
+        run: |
+          python3 scripts/macos-window-diagnostic/run.py \
+            "$RUNNER_TEMP/window-diagnostic/WindowProbe" "$RUNNER_TEMP/window-diagnostic/cases"
+      - name: Upload all diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-window-diagnostic
+          path: |
+            ${{ runner.temp }}/window-diagnostic/**
+            !${{ runner.temp }}/window-diagnostic/WindowProbe
+            !${{ runner.temp }}/window-diagnostic/cases/**/Target.app/**
+          if-no-files-found: error
+          retention-days: 7
