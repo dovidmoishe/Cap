@@ -180,11 +180,14 @@ def main():
                 "executable": str(executable),
                 "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
                 "uninstrumented_sources": expected,
+                "instrumented_sources": {name: hashlib.sha256((variant_output / name).read_bytes()).hexdigest() for name in FILES},
             })
         (output / "binaries.json").write_text(json.dumps({
             "baseline_commit": manifest["baseline_commit"],
             "revised_snapshot": manifest,
             "profile": "release, unmodified Cargo profile, Rust 1.95.0",
+            "instrumentation_sha256": text_hash(script.read_text()),
+            "cargo_lock_sha256": hashlib.sha256((root / "Cargo.lock").read_bytes()).hexdigest(),
             "binaries": binaries,
             "validate_only": args.validate_only,
         }, indent=2))

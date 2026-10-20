@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 defaults:
   run:
@@ -19,10 +20,78 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  smoke:
+  validate:
     if: github.repository == 'dovidmoishe/Cap'
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 10
+    outputs:
+      reuse-run: ${{ steps.mode.outputs.reuse-run }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Select build or artifact-only retry
+        id: mode
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          mode = Path("scripts/screenshot-startup-benchmark/reuse-build-run.txt").read_text().strip()
+          if mode != "build" and not (mode.isascii() and mode.isdecimal() and int(mode) > 0):
+              raise ValueError("Expected 'build' or a positive fork Actions run ID")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"reuse-run={mode}\n")
+          PY
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13"
+      - name: Prepare validation output
+        run: |
+          mkdir -p "$RUNNER_TEMP/image-validation/input"
+          sw_vers > "$RUNNER_TEMP/image-validation/os.txt"
+          python3 --version >> "$RUNNER_TEMP/image-validation/os.txt"
+      - name: Compile checker and probe before any Cap build
+        run: |
+          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
+            -framework AppKit -framework ScreenCaptureKit \
+            scripts/screenshot-startup-benchmark/cap-fixture.swift \
+            -o "$RUNNER_TEMP/image-validation/cap-fixture" 2>&1 | tee "$RUNNER_TEMP/image-validation/fixture-compile.log"
+          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
+            -framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit \
+            scripts/screenshot-startup-benchmark/runner-probe.swift \
+            -o "$RUNNER_TEMP/image-validation/runner-probe" 2>&1 | tee "$RUNNER_TEMP/image-validation/probe-compile.log"
+          test -x "$RUNNER_TEMP/image-validation/cap-fixture"
+          test -x "$RUNNER_TEMP/image-validation/runner-probe"
+      - name: Download investigated smoke images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 39415518245 --repo "$GITHUB_REPOSITORY" \
+            --name cap-screenshot-smoke-macos-15 --dir "$RUNNER_TEMP/image-validation/input"
+      - name: Check real images, wrong images, and exact interior comparison
+        run: |
+          python3 scripts/screenshot-startup-benchmark/validate-images.py \
+            "$RUNNER_TEMP/image-validation/cap-fixture" "$RUNNER_TEMP/image-validation/input" \
+            "$RUNNER_TEMP/image-validation/checks"
+          python3 scripts/screenshot-startup-benchmark/test-tooling.py
+      - name: Verify graphics before allowing a Cap build
+        run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$RUNNER_TEMP/image-validation"
+      - name: Upload validator evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cap-screenshot-validator-macos-15
+          path: |
+            ${{ runner.temp }}/image-validation/**
+            !${{ runner.temp }}/image-validation/cap-fixture
+            !${{ runner.temp }}/image-validation/runner-probe
+          retention-days: 7
+
+  build:
+    needs: validate
+    if: needs.validate.outputs.reuse-run == 'build'
+    runs-on: macos-15
+    timeout-minutes: 100
     env:
       RUSTUP_TOOLCHAIN: 1.95.0
       RUST_TARGET_TRIPLE: aarch64-apple-darwin
@@ -31,37 +100,18 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Prepare output and record environment
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13"
+      - name: Prepare output and record build environment
         run: |
-          SMOKE_OUTPUT="$RUNNER_TEMP/cap-screenshot-smoke"
+          SMOKE_OUTPUT="$RUNNER_TEMP/cap-screenshot-build"
           echo "SMOKE_OUTPUT=$SMOKE_OUTPUT" >> "$GITHUB_ENV"
-          mkdir -p "$SMOKE_OUTPUT/preflight"
+          mkdir -p "$SMOKE_OUTPUT"
           sw_vers > "$SMOKE_OUTPUT/os.txt"
           uname -m >> "$SMOKE_OUTPUT/os.txt"
           xcodebuild -version >> "$SMOKE_OUTPUT/os.txt"
-          printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion" >> "$SMOKE_OUTPUT/os.txt"
-          system_profiler SPHardwareDataType SPDisplaysDataType -json > "$SMOKE_OUTPUT/hardware.json"
           df -h > "$SMOKE_OUTPUT/disk-before.txt"
-      - name: Compile runner and fixture helpers
-        run: |
-          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
-            -framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit \
-            scripts/screenshot-startup-benchmark/runner-probe.swift \
-            -o "$SMOKE_OUTPUT/preflight/runner-probe" 2>&1 | tee "$SMOKE_OUTPUT/probe-compile.log"
-          test -x "$SMOKE_OUTPUT/preflight/runner-probe"
-          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
-            -framework AppKit -framework ScreenCaptureKit \
-            scripts/screenshot-startup-benchmark/cap-fixture.swift \
-            -o "$SMOKE_OUTPUT/cap-fixture" 2>&1 | tee "$SMOKE_OUTPUT/fixture-compile.log"
-          test -x "$SMOKE_OUTPUT/cap-fixture"
-      - name: Verify graphics and capture on this job's runner
-        run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$SMOKE_OUTPUT/preflight"
-      - name: Verify fixture decoder before building Cap
-        run: |
-          "$SMOKE_OUTPUT/cap-fixture" --inspect-image "$SMOKE_OUTPUT/preflight/captured-display.png" \
-            | tee "$SMOKE_OUTPUT/fixture-selfcheck.json"
-          python3 -c 'import json, sys; result = json.load(sys.stdin); sys.exit(0 if result.get("fixtureMatches") is True else 1)' \
-            < "$SMOKE_OUTPUT/fixture-selfcheck.json"
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.95.0 --profile minimal --component rustfmt
@@ -79,16 +129,91 @@ jobs:
           ./scripts/prepare-gpui-dependency.sh 2>&1 | tee "$SMOKE_OUTPUT/gpui-setup.log"
       - name: Build instrumented baseline and revised release binaries
         run: python3 scripts/screenshot-startup-benchmark/build-cap.py "$SMOKE_OUTPUT/builds"
-      - name: Verify capture, visible editor image, and normal editor close
-        run: python3 scripts/screenshot-startup-benchmark/run-cap-smoke.py "$SMOKE_OUTPUT"
-      - name: Upload smoke evidence
+      - name: Package executables, sources, frameworks, and libraries
+        run: python3 scripts/screenshot-startup-benchmark/bundle-cap.py create "$SMOKE_OUTPUT/builds" "$SMOKE_OUTPUT/runtime"
+      - name: Retain runtime archive before testing
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cap-screenshot-runtime-macos-15
+          path: |
+            ${{ runner.temp }}/cap-screenshot-build/runtime/cap-screenshot-runtime.tar.gz
+            ${{ runner.temp }}/cap-screenshot-build/runtime/cap-screenshot-runtime.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Upload build provenance and partial build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cap-screenshot-build-evidence-macos-15
+          path: |
+            ${{ runner.temp }}/cap-screenshot-build/**
+            !${{ runner.temp }}/cap-screenshot-build/runtime/**
+          if-no-files-found: warn
+          retention-days: 7
+
+  smoke:
+    needs: [validate, build]
+    if: always() && needs.validate.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.13"
+      - name: Prepare isolated test output and record environment
+        run: |
+          SMOKE_OUTPUT="$RUNNER_TEMP/cap-screenshot-smoke"
+          echo "SMOKE_OUTPUT=$SMOKE_OUTPUT" >> "$GITHUB_ENV"
+          mkdir -p "$SMOKE_OUTPUT/preflight" "$RUNNER_TEMP/runtime-download"
+          sw_vers > "$SMOKE_OUTPUT/os.txt"
+          uname -m >> "$SMOKE_OUTPUT/os.txt"
+          xcodebuild -version >> "$SMOKE_OUTPUT/os.txt"
+          printf 'ImageOS=%s\nImageVersion=%s\n' "$ImageOS" "$ImageVersion" >> "$SMOKE_OUTPUT/os.txt"
+          system_profiler SPHardwareDataType SPDisplaysDataType -json > "$SMOKE_OUTPUT/hardware.json"
+      - name: Download the pinned runtime package from this fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN: ${{ needs.validate.outputs.reuse-run }}
+        run: |
+          SOURCE_RUN="$REUSE_RUN"
+          if [ "$SOURCE_RUN" = build ]; then SOURCE_RUN="$GITHUB_RUN_ID"; fi
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" \
+            --name cap-screenshot-runtime-macos-15 --dir "$RUNNER_TEMP/runtime-download"
+          printf '%s\n' "$SOURCE_RUN" > "$SMOKE_OUTPUT/package-source-run.txt"
+          python3 scripts/screenshot-startup-benchmark/bundle-cap.py extract \
+            "$RUNNER_TEMP/runtime-download/cap-screenshot-runtime.tar.gz" "$RUNNER_TEMP/extracted-cap" \
+            --expected-run "$SOURCE_RUN"
+          test ! -e target/Frameworks
+          test ! -e target/native-deps
+      - name: Compile runner and fixture helpers
+        run: |
+          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
+            -framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit \
+            scripts/screenshot-startup-benchmark/runner-probe.swift \
+            -o "$SMOKE_OUTPUT/preflight/runner-probe" 2>&1 | tee "$SMOKE_OUTPUT/probe-compile.log"
+          xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
+            -framework AppKit -framework ScreenCaptureKit \
+            scripts/screenshot-startup-benchmark/cap-fixture.swift \
+            -o "$SMOKE_OUTPUT/cap-fixture" 2>&1 | tee "$SMOKE_OUTPUT/fixture-compile.log"
+          test -x "$SMOKE_OUTPUT/preflight/runner-probe"
+          test -x "$SMOKE_OUTPUT/cap-fixture"
+      - name: Verify graphics and capture on this fresh test runner
+        run: python3 scripts/screenshot-startup-benchmark/run-probe.py "$SMOKE_OUTPUT/preflight"
+      - name: Launch extracted binaries and verify screenshot editor
+        run: |
+          python3 scripts/screenshot-startup-benchmark/run-cap-smoke.py "$SMOKE_OUTPUT" \
+            --package "$RUNNER_TEMP/extracted-cap/package"
+      - name: Upload all smoke evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: cap-screenshot-smoke-macos-15
           path: |
             ${{ runner.temp }}/cap-screenshot-smoke/**
-            !${{ runner.temp }}/cap-screenshot-smoke/builds/*/cap-gpui
             !${{ runner.temp }}/cap-screenshot-smoke/cap-fixture
             !${{ runner.temp }}/cap-screenshot-smoke/preflight/runner-probe
           if-no-files-found: warn

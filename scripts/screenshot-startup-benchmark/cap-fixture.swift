@@ -1,34 +1,84 @@
 import AppKit
+import CryptoKit
 import Darwin
 import ScreenCaptureKit
+
+let comparisonBorder = 16
+
+func rawRGB(_ bitmap: NSBitmapImageRep, x: Int, y: Int) -> [Double] {
+    guard bitmap.bitsPerSample == 8, bitmap.colorSpace.colorSpaceModel == .rgb,
+          bitmap.samplesPerPixel == (bitmap.hasAlpha ? 4 : 3),
+          !bitmap.bitmapFormat.contains(.alphaFirst) else { return [] }
+    var pixel = [Int](repeating: 0, count: 4)
+    pixel.withUnsafeMutableBufferPointer { bitmap.getPixel($0.baseAddress!, atX: x, y: y) }
+    guard !bitmap.hasAlpha || pixel[3] == 255 else { return [] }
+    return pixel.prefix(3).map { Double($0) / 255 }
+}
 
 func imageEvidence(_ bitmap: NSBitmapImageRep) -> [String: Any] {
     var counts = [0, 0, 0]
     var total = 0
     for y in stride(from: 0, to: bitmap.pixelsHigh, by: max(1, bitmap.pixelsHigh / 64)) {
         for x in stride(from: 0, to: bitmap.pixelsWide, by: max(1, bitmap.pixelsWide / 64)) {
-            guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
-            let r = color.redComponent
-            let g = color.greenComponent
-            let b = color.blueComponent
+            let rgb = rawRGB(bitmap, x: x, y: y)
+            total += 1
+            guard rgb.count == 3 else { continue }
+            let r = rgb[0]
+            let g = rgb[1]
+            let b = rgb[2]
             if r > 0.6 && g < 0.3 && b < 0.4 { counts[0] += 1 }
             if g > 0.5 && r < 0.3 && b < 0.4 { counts[1] += 1 }
             if b > 0.6 && r < 0.3 && g < 0.4 { counts[2] += 1 }
-            total += 1
         }
     }
     let ratios = counts.map { Double($0) / Double(max(1, total)) }
     let centers = [bitmap.pixelsWide / 6, bitmap.pixelsWide / 2, bitmap.pixelsWide * 5 / 6].map { x -> [Double] in
-        guard let color = bitmap.colorAt(x: x, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.deviceRGB) else { return [] }
-        return [Double(color.redComponent), Double(color.greenComponent), Double(color.blueComponent)]
+        rawRGB(bitmap, x: x, y: bitmap.pixelsHigh / 2)
     }
     let fixtureMatches = centers.allSatisfy { $0.count == 3 } &&
         centers[0][0] > 0.6 && centers[0][1] < 0.3 && centers[0][2] < 0.4 &&
         centers[1][2] > 0.6 && centers[1][0] < 0.3 && centers[1][1] < 0.4 &&
         centers[2][1] > 0.5 && centers[2][0] < 0.3 && centers[2][2] < 0.4
+    let converted = [bitmap.pixelsWide / 6, bitmap.pixelsWide / 2, bitmap.pixelsWide * 5 / 6].map { x -> [Double] in
+        guard let color = bitmap.colorAt(x: x, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.deviceRGB) else { return [] }
+        return [Double(color.redComponent), Double(color.greenComponent), Double(color.blueComponent)]
+    }
     return ["width": bitmap.pixelsWide, "height": bitmap.pixelsHigh, "sampleRGB": centers,
+            "validationSpace": "stored opaque 8-bit RGB samples", "convertedDeviceRGB": converted,
             "colorRatios": ratios, "fixtureMatches": fixtureMatches,
             "containsFixtureColors": ratios.allSatisfy { $0 > 0.05 }]
+}
+
+func compareImages(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep) throws -> [String: Any] {
+    guard first.pixelsWide == second.pixelsWide, first.pixelsHigh == second.pixelsHigh,
+          first.pixelsWide > comparisonBorder * 2, first.pixelsHigh > comparisonBorder * 2 else {
+        throw NSError(domain: "comparison-dimensions", code: 1)
+    }
+    var interiorDifferences = 0
+    var exterior: [[String: Any]] = []
+    var firstInterior = Data()
+    var secondInterior = Data()
+    for y in 0..<first.pixelsHigh {
+        for x in 0..<first.pixelsWide {
+            let a = rawRGB(first, x: x, y: y)
+            let b = rawRGB(second, x: x, y: y)
+            guard a.count == 3, b.count == 3 else { throw NSError(domain: "comparison-bitmap-format", code: 2) }
+            let interior = x >= comparisonBorder && x < first.pixelsWide - comparisonBorder &&
+                y >= comparisonBorder && y < first.pixelsHigh - comparisonBorder
+            if interior {
+                firstInterior.append(contentsOf: a.map { UInt8(($0 * 255).rounded()) })
+                secondInterior.append(contentsOf: b.map { UInt8(($0 * 255).rounded()) })
+                if a != b { interiorDifferences += 1 }
+            } else if a != b {
+                exterior.append(["x": x, "y": y, "baselineRGB": a, "revisedRGB": b])
+            }
+        }
+    }
+    func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    return ["width": first.pixelsWide, "height": first.pixelsHigh, "excludedBorderPixels": comparisonBorder,
+            "interiorDifferentPixels": interiorDifferences, "interiorMatches": interiorDifferences == 0,
+            "baselineInteriorSHA256": digest(firstInterior), "revisedInteriorSHA256": digest(secondInterior),
+            "exteriorDifferentPixels": exterior.count, "exteriorDifferences": exterior]
 }
 
 func writeJSON(_ value: [String: Any], to path: URL) throws {
@@ -141,6 +191,21 @@ final class Fixture: NSObject, NSApplicationDelegate {
 struct Main {
     @MainActor
     static func main() {
+        if CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--compare-images" {
+            do {
+                let images = try CommandLine.arguments.suffix(2).map { path -> NSBitmapImageRep in
+                    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+                    guard let bitmap = NSBitmapImageRep(data: data) else { throw NSError(domain: "decode", code: 1) }
+                    return bitmap
+                }
+                let data = try JSONSerialization.data(withJSONObject: compareImages(images[0], images[1]), options: [.sortedKeys])
+                print(String(decoding: data, as: UTF8.self))
+            } catch {
+                fputs("Image comparison failed: \(error)\n", stderr)
+                exit(2)
+            }
+            return
+        }
         guard CommandLine.arguments.count == 3 else { exit(2) }
         if CommandLine.arguments[1] == "--inspect-image" {
             guard let contents = try? Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2])),

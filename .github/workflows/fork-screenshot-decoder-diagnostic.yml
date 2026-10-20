@@ -28,6 +28,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Record environment
         run: |
           DIAGNOSTIC_OUTPUT="$RUNNER_TEMP/screenshot-decoder-diagnostic"
@@ -44,9 +45,11 @@ jobs:
             --name cap-screenshot-smoke-macos-15 --dir "$DIAGNOSTIC_OUTPUT/input"
       - name: Compile only the image helpers
         run: |
+          git show 7038923ca3c208c4a8eefbde4385ba33a0cfdf98:scripts/screenshot-startup-benchmark/cap-fixture.swift \
+            > "$DIAGNOSTIC_OUTPUT/original-checker.swift"
           xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
             -framework AppKit -framework ScreenCaptureKit \
-            scripts/screenshot-startup-benchmark/cap-fixture.swift \
+            "$DIAGNOSTIC_OUTPUT/original-checker.swift" \
             -o "$DIAGNOSTIC_OUTPUT/original-checker" 2>&1 | tee "$DIAGNOSTIC_OUTPUT/original-compile.log"
           test -x "$DIAGNOSTIC_OUTPUT/original-checker"
           xcrun swiftc -swift-version 5 -parse-as-library -target arm64-apple-macosx15.0 \
