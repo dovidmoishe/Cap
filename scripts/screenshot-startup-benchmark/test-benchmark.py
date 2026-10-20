@@ -164,19 +164,20 @@ class CaptureModeTests(unittest.TestCase):
                         "helperWindowCount": 0, "pixelWidth": 96, "pixelHeight": 64}))
                 else:
                     self.assertNotIn("DYLD_PRINT_LIBRARIES", kwargs["env"])
-                    kwargs["stdout"].write("main window opened\n")
+                    kwargs["stdout"].write("main window opened number=76\n")
                     kwargs["stdout"].flush()
                 return child
 
             def tick(delay):
                 clock[0] += delay
-                if (directory / "cap-pid").exists() and not (directory / "capture-saved").exists():
-                    self.assertEqual((directory / "cap-pid").read_text(), "42")
+                if (directory / "desktop-request.json").exists() and not (directory / "capture-saved").exists():
+                    self.assertEqual(json.loads((directory / "desktop-request.json").read_text()), {"ownerPID": 42, "mainWindowNumber": 76})
+                    self.assertFalse((directory / "desktop-request.pending").exists())
                     (directory / "desktop-hidden.json").write_text(json.dumps({"ownerPID": 42, "hidden": True,
-                        "visibleMainWindows": 0, "mainWindowLevel": 100, "stableHiddenMs": 300,
+                        "visibleMainWindows": 0, "mainWindowNumber": 76, "mainWindowObserved": True, "stableHiddenMs": 300,
                         "hideRequestCount": 1, "hideReturned": False,
                         "hiddenUTC": "2026-10-20T00:00:00Z"}))
-                    (directory / "cap.log").write_text('main window opened\n'
+                    (directory / "cap.log").write_text('main window opened number=76\n'
                         '2026-10-20T00:00:01Z INFO CAP_BENCH_CAPTURE\n'
                         '2026-10-20T00:00:01.001Z INFO CAP_BENCH_DRAW kind="preview" elapsed_ms=1 bounds=same\n'
                         '2026-10-20T00:00:01.030Z INFO CAP_BENCH_DRAW kind="gpu" elapsed_ms=30 bounds=same\n'
@@ -241,14 +242,38 @@ class CaptureModeTests(unittest.TestCase):
 
 
 class DesktopPreparationTests(unittest.TestCase):
+    def test_window_number_comes_from_real_startup_log_not_an_editor_log(self):
+        log = ('2026-10-20T19:28:52.006198Z INFO cap_gpui: main window opened number=76\n'
+               '2026-10-20T19:28:54.160635Z INFO cap_gpui::app_windows: screenshot editor window opened number=85 path=test\n')
+        self.assertEqual(benchmark.smoke.main_window_number(log), 76)
+        self.assertEqual(benchmark.smoke.main_window_number("number=76 main window opened"), 76)
+
+    def test_missing_ambiguous_or_invalid_window_numbers_are_rejected(self):
+        for log in ["", "main window opened", "main window opened number=None", "main window opened number=0",
+                    "main window opened number=-1", "main window opened number=4294967296",
+                    "main window opened number=76.5", "screenshot editor window opened number=85",
+                    "main window opened number=76\nmain window opened number=85"]:
+            with self.subTest(log=log), self.assertRaises(RuntimeError):
+                benchmark.smoke.main_window_number(log)
+
+    def test_invalid_identity_cannot_publish_a_desktop_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for pid, number in [(0, 76), (1, 76), (True, 76), (0x80000000, 76), (42, 0), (42, -1),
+                                (42, 0x100000000), (42, True), (42, 76.5), (42, None)]:
+                with self.subTest(pid=pid, number=number), self.assertRaises(ValueError):
+                    benchmark.smoke.request_desktop_preparation(directory, pid, number)
+                self.assertFalse((directory / "desktop-request.json").exists())
+
     def test_missing_or_late_hiding_cannot_be_counted_as_valid(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             evidence = {"ownerPID": 42, "hidden": True, "visibleMainWindows": 0,
-                        "mainWindowLevel": 100, "stableHiddenMs": 300, "hiddenUTC": "2026-10-20T00:00:00Z",
+                        "mainWindowNumber": 76, "mainWindowObserved": True, "stableHiddenMs": 300, "hiddenUTC": "2026-10-20T00:00:00Z",
                         "hideRequestCount": 1, "hideReturned": False}
-            log = "2026-10-20T00:00:01Z INFO CAP_BENCH_CAPTURE\n"
-            cases = [{"ownerPID": 99}, {"hidden": False}, {"visibleMainWindows": 1}, {"mainWindowLevel": 0},
+            log = "main window opened number=76\n2026-10-20T00:00:01Z INFO CAP_BENCH_CAPTURE\n"
+            cases = [{"ownerPID": 99}, {"hidden": False}, {"visibleMainWindows": 1}, {"mainWindowNumber": 85},
+                     {"mainWindowNumber": None}, {"mainWindowNumber": 76.0}, {"mainWindowObserved": False},
                      {"stableHiddenMs": 100}, {"hiddenUTC": "2026-10-20T00:00:00.900Z"},
                      {"hiddenUTC": "2026-10-20T00:00:01.100Z"}, {"hideRequestCount": 2}, {"hideRequestCount": 0},
                      {"hideReturned": None}, {"hideReturned": "false"}]

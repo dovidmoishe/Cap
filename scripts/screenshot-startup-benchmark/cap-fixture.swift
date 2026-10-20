@@ -94,6 +94,11 @@ func writeJSON(_ value: [String: Any], to path: URL) throws {
 
 @MainActor
 final class Fixture: NSObject, NSApplicationDelegate {
+    private struct DesktopRequest: Decodable {
+        let ownerPID: Int32
+        let mainWindowNumber: UInt32
+    }
+
     enum Mode: Equatable { case colored, desktop, testWindow }
     let directory: URL
     let mode: Mode
@@ -143,10 +148,17 @@ final class Fixture: NSObject, NSApplicationDelegate {
             }
             return
         }
-        let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        let window: NSWindow
+        if mode == .testWindow {
+            let panel = NSPanel(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            panel.hidesOnDeactivate = false
+            window = panel
+        } else {
+            window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        }
         self.window = window
         let fixtureLevelAboveCapMainPanel = NSWindow.Level(rawValue: 101)
-        window.level = mode == .testWindow ? NSWindow.Level(rawValue: 100) : fixtureLevelAboveCapMainPanel
+        window.level = mode == .testWindow ? .floating : fixtureLevelAboveCapMainPanel
         window.title = "Cap fixed screenshot fixture"
         window.isReleasedWhenClosed = false
         let root = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
@@ -168,6 +180,10 @@ final class Fixture: NSObject, NSApplicationDelegate {
                 try writeJSON(["pixelWidth": CGDisplayPixelsWide(CGMainDisplayID()),
                                "pixelHeight": CGDisplayPixelsHigh(CGMainDisplayID()),
                                "displayScale": screen.backingScaleFactor,
+                               "windowNumber": window.windowNumber,
+                               "windowNumberOwnedOnScreen": ownedWindows(getpid()).contains {
+                                   ($0[kCGWindowNumber as String] as? NSNumber)?.intValue == window.windowNumber
+                               },
                                "visible": window.isVisible], to: directory.appendingPathComponent("fixture-ready.json"))
             } catch { fail(error) }
         }
@@ -182,20 +198,24 @@ final class Fixture: NSObject, NSApplicationDelegate {
     }
 
     private func prepareDesktop() {
-        let request = directory.appendingPathComponent("cap-pid")
+        let request = directory.appendingPathComponent("desktop-request.json")
         guard !hidden, FileManager.default.fileExists(atPath: request.path) else { return }
         do {
-            guard let pid = Int32(try String(contentsOf: request, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)),
-                  pid != getpid() else { throw NSError(domain: "cap-pid", code: 1) }
+            let identity = try JSONDecoder().decode(DesktopRequest.self, from: Data(contentsOf: request))
+            let pid = identity.ownerPID
+            guard pid > 1, pid != getpid(), identity.mainWindowNumber > 0 else {
+                throw NSError(domain: "desktop-request", code: 1)
+            }
             guard let application = NSRunningApplication(processIdentifier: pid) else { return }
             let now = ProcessInfo.processInfo.systemUptime
             if preparationStartedAt == nil { preparationStartedAt = now }
             let windows = try ownedWindows(pid)
-            let mainWindows = windows.filter { ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 100 }
+            let mainWindows = windows.filter { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == identity.mainWindowNumber }
             if !mainWindows.isEmpty { mainWindowObserved = true }
-            try writeJSON(["ownerPID": pid, "hidden": application.isHidden,
+            try writeJSON(["ownerPID": pid, "mainWindowNumber": identity.mainWindowNumber, "hidden": application.isHidden,
                            "activationPolicy": application.activationPolicy.rawValue,
                            "mainWindowObserved": mainWindowObserved, "visibleMainWindows": mainWindows.count,
+                           "visibleWindowNumbers": windows.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value },
                            "visibleWindowLayers": windows.compactMap { ($0[kCGWindowLayer as String] as? NSNumber)?.intValue },
                            "hideRequested": hideReturned != nil, "hideReturned": hideReturned.map { $0 as Any } ?? NSNull()],
                           to: directory.appendingPathComponent("desktop-state.json"))
@@ -212,7 +232,8 @@ final class Fixture: NSObject, NSApplicationDelegate {
             guard let since = hiddenSince else { hiddenSince = now; return }
             guard now - since >= 0.25 else { return }
             try writeJSON(["ownerPID": pid, "hidden": true, "hiddenUTC": utc(),
-                           "visibleMainWindows": mainWindows.count, "mainWindowLevel": 100,
+                           "visibleMainWindows": mainWindows.count, "mainWindowNumber": identity.mainWindowNumber,
+                           "mainWindowObserved": mainWindowObserved,
                            "hideRequestCount": 1, "hideReturned": hideReturned ?? false,
                            "activationPolicyAtRequest": activationPolicyAtRequest ?? -1,
                            "activationPolicy": application.activationPolicy.rawValue,

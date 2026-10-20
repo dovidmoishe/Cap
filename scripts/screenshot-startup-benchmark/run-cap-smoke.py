@@ -40,6 +40,24 @@ def inspect_image(fixture, path, output):
     return json.loads(result.stdout)
 
 
+def main_window_number(log):
+    lines = [line for line in log.splitlines() if re.search(r"\bmain window opened\b", line)]
+    if len(lines) != 1:
+        raise RuntimeError("Expected exactly one main-window startup log")
+    number = re.search(r"\bnumber=([0-9]+)(?=\s|$)", lines[0])
+    if not number or not 0 < int(number[1]) <= 0xFFFFFFFF:
+        raise RuntimeError("Main-window startup log has no valid window number")
+    return int(number[1])
+
+
+def request_desktop_preparation(directory, pid, number):
+    if type(pid) is not int or not 1 < pid <= 0x7FFFFFFF or type(number) is not int or not 0 < number <= 0xFFFFFFFF:
+        raise ValueError("Expected a process ID and a positive native window number")
+    pending = directory / "desktop-request.pending"
+    pending.write_text(json.dumps({"ownerPID": pid, "mainWindowNumber": number}))
+    pending.replace(directory / "desktop-request.json")
+
+
 def validate_desktop_preparation(directory, pid, log):
     hidden = json.loads((directory / "desktop-hidden.json").read_text())
     capture = re.search(r"^(\S+) .*CAP_BENCH_CAPTURE\s*$", log, re.MULTILINE)
@@ -47,8 +65,9 @@ def validate_desktop_preparation(directory, pid, log):
         raise RuntimeError("Capture start timestamp missing")
     if hidden.get("ownerPID") != pid or hidden.get("hidden") is not True or hidden.get("visibleMainWindows") != 0:
         raise RuntimeError("Desktop preparation did not verify the owned Cap main window was hidden")
-    if hidden.get("mainWindowLevel") != 100 or hidden.get("stableHiddenMs", 0) < 250:
-        raise RuntimeError("Desktop preparation did not verify a stable hidden main panel")
+    number = main_window_number(log)
+    if type(hidden.get("mainWindowNumber")) is not int or hidden["mainWindowNumber"] != number or hidden.get("mainWindowObserved") is not True or hidden.get("stableHiddenMs", 0) < 250:
+        raise RuntimeError("Desktop preparation did not verify the logged main window was observed and stably hidden")
     if hidden.get("hideRequestCount") != 1 or type(hidden.get("hideReturned")) is not bool:
         raise RuntimeError("Desktop preparation did not record exactly one hide request and its return value")
     started = datetime.fromisoformat(capture[1].replace("Z", "+00:00"))
@@ -120,9 +139,7 @@ def run_variant(package, output, fixture, binary, *, capture_editor=True, deskto
                     if main_seen is None:
                         main_seen = time.monotonic()
                     if time.monotonic() - main_seen >= 0.4:
-                        pending = directory / "cap-pid.pending"
-                        pending.write_text(str(child.pid))
-                        pending.replace(directory / "cap-pid")
+                        request_desktop_preparation(directory, child.pid, main_window_number(log))
                         desktop_requested = True
                 preview = draw(log, "preview")
                 gpu = draw(log, "gpu")

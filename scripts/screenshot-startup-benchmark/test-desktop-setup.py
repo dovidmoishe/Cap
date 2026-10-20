@@ -41,13 +41,16 @@ def main():
             report.update({"helper": ready, "target": target_ready})
             if ready.get("helperWindowCount") != 0 or ready.get("activeDisplay") is not True or target_ready.get("visible") is not True:
                 raise ValueError("Expected a windowless desktop helper and visible stand-in main panel")
-            pending = helper_dir / "cap-pid.pending"
-            pending.write_text(str(children[1].pid))
-            pending.replace(helper_dir / "cap-pid")
+            number = target_ready.get("windowNumber")
+            if target_ready.get("windowNumberOwnedOnScreen") is not True:
+                raise ValueError("Stand-in window number did not identify an owned on-screen native window")
+            smoke.request_desktop_preparation(helper_dir, children[1].pid, number)
             hidden = wait_json(helper_dir / "desktop-hidden.json", children)
             report["hidden"] = hidden
             if hidden.get("ownerPID") != children[1].pid or hidden.get("hidden") is not True or hidden.get("visibleMainWindows") != 0 or hidden.get("stableHiddenMs", 0) < 250:
                 raise ValueError("Stand-in main panel did not become stably hidden")
+            if hidden.get("mainWindowNumber") != number or hidden.get("mainWindowObserved") is not True:
+                raise ValueError("Desktop helper did not verify the specific stand-in window number")
             if hidden.get("hideRequestCount") != 1 or type(hidden.get("hideReturned")) is not bool:
                 raise ValueError("Expected one hide request with its return value retained as evidence")
             (target_dir / "unhide-request").write_text("ready")
