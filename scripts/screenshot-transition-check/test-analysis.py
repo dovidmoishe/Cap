@@ -65,6 +65,20 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(result["status"], "possible-visual-discontinuity")
         self.assertEqual(result["possibleBlankFrames"], [15])
 
+    def test_long_gpu_initialization_keeps_early_preview_evidence(self):
+        self.capture["diagnosticGPU"]["utc"] = "2026-10-20T00:00:04.650Z"
+        for index in range(60, 280):
+            self.report["frames"].append({"file": "frames/0059.png", "utc": BASE + index * 0.02, "freshPixels": False})
+        self.report["stream"]["evictedEvents"] = 0
+        result = analysis.transition(self.root, self.report, self.capture)
+        self.assertEqual(result["status"], "evidence-ready-for-review")
+        self.assertGreaterEqual(result["rawPreviewSamples"], 2)
+        self.assertGreaterEqual(result["postGPUSamples"], 2)
+        self.assertLessEqual(result["maximumPresentationGapMs"], 50)
+        self.report["stream"]["evictedEvents"] = 1
+        with self.assertRaisesRegex(analysis.Inconclusive, "discarded frames"):
+            analysis.transition(self.root, self.report, self.capture)
+
     def test_small_color_changes_are_reported_for_manual_review(self):
         changed = self.pattern.copy()
         changed[12:20, 12:20, 0] -= 1
@@ -204,7 +218,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(report["revisedExecutableSHA256"], "test-executable-hash")
             self.assertEqual(smoke.run_variant.call_args.kwargs, {"capture_editor": False, "desktop": True})
             self.assertEqual(smoke.run_variant.call_args.args[3]["variant"], "revised")
-            child.wait.assert_called_once_with(timeout=30)
+            child.wait.assert_called_once_with(timeout=120)
             smoke.terminate.assert_called_once_with(child)
 
 

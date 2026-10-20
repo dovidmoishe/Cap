@@ -54,7 +54,7 @@ def collect(package, output, fixture, recorder):
             report["capture"] = result
             if not result.get("passed"):
                 raise RuntimeError(f"Cap capture failed: {result.get('error')}")
-            child.wait(timeout=30)
+            child.wait(timeout=120)
             if child.returncode != 0:
                 raise RuntimeError("Recorder did not finish cleanly; inspect recorder.log and recording.json")
         analysis = subprocess.run([sys.executable, str(Path(__file__).with_name("analyze.py")), str(recordings), "--capture", str(capture)],

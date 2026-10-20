@@ -44,18 +44,33 @@ struct StoredFrame {
     }
 }
 
+struct SpooledFrame {
+    let path: URL
+    let width: Int
+    let height: Int
+    let stride: Int
+    var metadata: [String: Any]
+}
+
 final class FrameStore: NSObject, SCStreamOutput, SCStreamDelegate {
     let queue = DispatchQueue(label: "cap-transition-frames")
     private let lock = NSLock()
-    private var frames: [StoredFrame] = []
+    private var frames: [SpooledFrame] = []
     private var lastFrame: StoredFrame?
+    private var lastSpool: SpooledFrame?
+    private let directory: URL
     private var statuses: [String: Int] = [:]
     private var errors: [String] = []
     private var unusableEvents: [[String: Any]] = []
-    private var evictions = 0
-    private var retainedBytes = 0
+    private var writtenBytes: Int64 = 0
     private var sequence = 0
-    private let byteLimit = 384 * 1024 * 1024
+    private let frameByteLimit = 64 * 1024 * 1024
+    private let diskByteLimit: Int64 = 4 * 1024 * 1024 * 1024
+
+    init(directory: URL) {
+        self.directory = directory
+        super.init()
+    }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         lock.lock()
@@ -67,6 +82,11 @@ final class FrameStore: NSObject, SCStreamOutput, SCStreamDelegate {
         guard outputType == .screen else { return }
         lock.lock()
         defer { lock.unlock() }
+        guard errors.isEmpty else { return }
+        guard frames.count < 2400 else {
+            errors.append("Recording exceeded its event budget; no frames were discarded")
+            return
+        }
         guard sampleBuffer.isValid,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let first = attachments.first, let raw = first[.status] as? Int,
@@ -82,17 +102,21 @@ final class FrameStore: NSObject, SCStreamOutput, SCStreamDelegate {
         let hostBefore = CMClockGetTime(CMClockGetHostTimeClock()).seconds
         let arrivalUTC = Date().timeIntervalSince1970
         let hostAfter = CMClockGetTime(CMClockGetHostTimeClock()).seconds
-        let presentation = sampleBuffer.presentationTimeStamp.seconds
+        guard let displayTime = first[.displayTime] as? UInt64, displayTime > 0 else {
+            errors.append("Missing ScreenCaptureKit display timestamp for status \(raw)")
+            return
+        }
+        let presentation = CMClockMakeHostTimeFromSystemUnits(displayTime).seconds
         guard presentation.isFinite, hostBefore.isFinite, hostAfter.isFinite else {
             errors.append("Nonfinite sample or host clock")
             return
         }
         let age = (hostBefore + hostAfter) / 2 - presentation
         guard age >= -0.05, age < 2, hostAfter - hostBefore < 0.01 else {
-            errors.append("Sample PTS could not be aligned to the host clock")
+            errors.append("Display timestamp could not be aligned to the host clock: status=\(raw), age=\(age), anchorSpan=\(hostAfter - hostBefore)")
             return
         }
-        var frame: StoredFrame
+        var frame: SpooledFrame
         if status == .complete {
             guard let buffer = sampleBuffer.imageBuffer,
                   CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
@@ -100,18 +124,34 @@ final class FrameStore: NSObject, SCStreamOutput, SCStreamDelegate {
                 errors.append("Missing BGRA buffer or buffer lock failed")
                 return
             }
-            defer { _ = CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
             let width = CVPixelBufferGetWidth(buffer)
             let height = CVPixelBufferGetHeight(buffer)
             let stride = CVPixelBufferGetBytesPerRow(buffer)
-            guard width > 0, height > 0, stride >= width * 4, height <= byteLimit / stride,
+            guard width > 0, height > 0, stride >= width * 4, height <= frameByteLimit / stride,
                   let base = CVPixelBufferGetBaseAddress(buffer) else {
+                _ = CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
                 errors.append("Frame exceeds the diagnostic memory budget or lacks pixel data")
                 return
             }
-            frame = StoredFrame(bytes: Data(bytes: base, count: stride * height), width: width, height: height, stride: stride, metadata: [:])
-            lastFrame = frame
-        } else if status == .idle, let previous = lastFrame {
+            let pixels = StoredFrame(bytes: Data(bytes: base, count: stride * height), width: width, height: height, stride: stride, metadata: [:])
+            guard CVPixelBufferUnlockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
+                errors.append("Cannot unlock copied capture buffer")
+                return
+            }
+            guard writtenBytes + Int64(pixels.bytes.count) <= diskByteLimit else {
+                errors.append("Recording exceeded its 4 GiB raw-frame disk budget; no frames were discarded")
+                return
+            }
+            let path = directory.appendingPathComponent(String(format: "%04d.bgra", sequence))
+            do { try pixels.bytes.write(to: path, options: .withoutOverwriting) } catch {
+                errors.append("Cannot spool captured pixels: \(error.localizedDescription)")
+                return
+            }
+            writtenBytes += Int64(pixels.bytes.count)
+            lastFrame = pixels
+            frame = SpooledFrame(path: path, width: width, height: height, stride: stride, metadata: [:])
+            lastSpool = frame
+        } else if status == .idle, let previous = lastSpool {
             frame = previous
         } else {
             unusableEvents.append(["utc": arrivalUTC, "status": raw])
@@ -119,31 +159,28 @@ final class FrameStore: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         frame.metadata = ["sequence": sequence, "utc": arrivalUTC - age, "arrivalUTC": arrivalUTC,
                           "presentationHostSeconds": presentation, "clockAgeMs": age * 1000,
+                          "displayTimeSystemUnits": displayTime,
+                          "samplePTSSeconds": sampleBuffer.presentationTimeStamp.seconds.isFinite ? sampleBuffer.presentationTimeStamp.seconds as Any : NSNull(),
                           "anchorSpanMs": (hostAfter - hostBefore) * 1000,
                           "freshPixels": status == .complete, "status": raw]
         sequence += 1
         frames.append(frame)
-        retainedBytes += frame.bytes.count
-        while frames.count > 120 || retainedBytes > byteLimit ||
-                (frames.first?.metadata["utc"] as? Double ?? arrivalUTC) < arrivalUTC - 2 {
-            retainedBytes -= frames.removeFirst().bytes.count
-            evictions += 1
-        }
     }
 
     func latest() -> StoredFrame? {
         lock.lock()
         defer { lock.unlock() }
-        return frames.last
+        return lastFrame
     }
 
-    func snapshot() -> ([StoredFrame], [String: Any]) {
+    func snapshot() -> ([SpooledFrame], [String: Any]) {
         lock.lock()
         defer { lock.unlock() }
-        return (frames, ["statuses": statuses, "errors": errors, "unusableEvents": unusableEvents, "evictedEvents": evictions,
+        return (frames, ["statuses": statuses, "errors": errors, "unusableEvents": unusableEvents, "evictedEvents": 0,
                          "retainedEvents": frames.count, "requestedFPS": 60,
-                         "maximumEvents": 120, "maximumBytes": byteLimit, "maximumSeconds": 2,
-                         "timeSource": "sample PTS aligned to CMClockGetHostTimeClock and UTC"])
+                         "maximumEvents": 2400, "maximumRawDiskBytes": diskByteLimit, "writtenRawBytes": writtenBytes,
+                         "maximumFrameBytes": frameByteLimit, "storage": "disk spool without eviction",
+                         "timeSource": "SCStreamFrameInfo.displayTime converted from system units to host time and aligned to UTC"])
     }
 }
 
@@ -152,7 +189,7 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
     let output: URL
     let capture: URL?
     let selfTest: Bool
-    private let store = FrameStore()
+    private let store: FrameStore
     private var stream: SCStream?
     private var window: NSPanel?
     private var middle: NSView?
@@ -169,6 +206,7 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
         self.output = output
         self.capture = capture
         self.selfTest = selfTest
+        self.store = FrameStore(directory: output.appendingPathComponent("raw"))
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -181,6 +219,7 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
     }
 
     private func start() async throws {
+        try FileManager.default.createDirectory(at: output.appendingPathComponent("raw"), withIntermediateDirectories: true)
         let displayID = CGMainDisplayID()
         guard let screen = NSScreen.screens.first(where: {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == displayID
@@ -259,11 +298,11 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
                     middle?.layer?.backgroundColor = CGColor(red: 0.05, green: 0.8, blue: 0.2, alpha: 1)
                     phase = 1
                     phaseEvents.append(["name": "green", "utc": now])
-                } else if phase == 1 && now - readyAt > 0.65 {
+                } else if phase == 1 && now - readyAt > 4.0 {
                     middle?.layer?.backgroundColor = CGColor(red: 0.05, green: 0.18, blue: 0.9, alpha: 1)
                     phase = 2
                     phaseEvents.append(["name": "blue-again", "utc": now])
-                } else if phase == 2 && now - readyAt > 1.1 {
+                } else if phase == 2 && now - readyAt > 4.6 {
                     finish(error: nil)
                 }
             }
@@ -316,9 +355,19 @@ final class RecorderApp: NSObject, NSApplicationDelegate {
                 let folder = output.appendingPathComponent("frames")
                 try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                 var rows: [[String: Any]] = []
-                for (index, frame) in frames.enumerated() {
-                    let name = String(format: "frames/%04d.png", index)
-                    try frame.png().write(to: output.appendingPathComponent(name))
+                var encoded: [URL: String] = [:]
+                for frame in frames {
+                    let name: String
+                    if let existing = encoded[frame.path] {
+                        name = existing
+                    } else {
+                        name = "frames/\(frame.path.deletingPathExtension().lastPathComponent).png"
+                        let pixels = StoredFrame(bytes: try Data(contentsOf: frame.path), width: frame.width,
+                                                 height: frame.height, stride: frame.stride, metadata: [:])
+                        try pixels.png().write(to: output.appendingPathComponent(name))
+                        encoded[frame.path] = name
+                        try FileManager.default.removeItem(at: frame.path)
+                    }
                     var metadata = frame.metadata
                     metadata["file"] = name
                     metadata["width"] = frame.width

@@ -24,6 +24,8 @@ def utc(value):
 def load_frames(root, report):
     if not report.get("completed") or report.get("stream", {}).get("errors"):
         raise Inconclusive(f"Recorder did not finish cleanly: {report.get('error', report.get('stream', {}).get('errors'))}")
+    if report.get("stream", {}).get("evictedEvents", 0):
+        raise Inconclusive("Recorder discarded frames; full transition history is unavailable")
     frames = report.get("frames", [])
     if len(frames) < 3 or any(not finite(frame.get("utc")) for frame in frames):
         raise Inconclusive("Not enough timestamped recorder frames")
@@ -33,14 +35,17 @@ def load_frames(root, report):
     if geometry.get("scale") != 1:
         raise Inconclusive("Display-coordinate projection is verified only at scale one")
     images = []
+    decoded = {}
     for frame in frames:
         path = (root / frame["file"]).resolve()
         if not path.is_relative_to(root.resolve()):
             raise Inconclusive("Recorded image path escapes its evidence directory")
-        with Image.open(path) as image:
-            if image.size != (geometry["width"], geometry["height"]):
-                raise Inconclusive("Captured frame dimensions differ from recorder geometry")
-            images.append(np.array(image.convert("RGB")))
+        if path not in decoded:
+            with Image.open(path) as image:
+                if image.size != (geometry["width"], geometry["height"]):
+                    raise Inconclusive("Captured frame dimensions differ from recorder geometry")
+                decoded[path] = np.array(image.convert("RGB"))
+        images.append(decoded[path])
     return frames, images
 
 
