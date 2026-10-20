@@ -49,6 +49,11 @@ func imageEvidence(_ bitmap: NSBitmapImageRep) -> [String: Any] {
             "containsFixtureColors": ratios.allSatisfy { $0 > 0.05 }]
 }
 
+func pngEvidence(_ png: Data) throws -> [String: Any] {
+    guard let bitmap = NSBitmapImageRep(data: png) else { throw NSError(domain: "png-decode", code: 1) }
+    return imageEvidence(bitmap)
+}
+
 func compareImages(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep) throws -> [String: Any] {
     guard first.pixelsWide == second.pixelsWide, first.pixelsHigh == second.pixelsHigh,
           first.pixelsWide > comparisonBorder * 2, first.pixelsHigh > comparisonBorder * 2 else {
@@ -173,7 +178,7 @@ final class Fixture: NSObject, NSApplicationDelegate {
                         throw NSError(domain: "editor-png", code: 3)
                     }
                     try png.write(to: directory.appendingPathComponent("editor.png"))
-                    var evidence = imageEvidence(bitmap)
+                    var evidence = try pngEvidence(png)
                     evidence["windowID"] = editor.windowID
                     evidence["ownerPID"] = pid
                     try writeJSON(evidence, to: directory.appendingPathComponent("editor-evidence.json"))
@@ -209,8 +214,8 @@ struct Main {
         guard CommandLine.arguments.count == 3 else { exit(2) }
         if CommandLine.arguments[1] == "--inspect-image" {
             guard let contents = try? Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2])),
-                  let bitmap = NSBitmapImageRep(data: contents),
-                  let data = try? JSONSerialization.data(withJSONObject: imageEvidence(bitmap), options: [.sortedKeys]),
+                  let evidence = try? pngEvidence(contents),
+                  let data = try? JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys]),
                   let text = String(data: data, encoding: .utf8) else { exit(2) }
             print(text)
             return

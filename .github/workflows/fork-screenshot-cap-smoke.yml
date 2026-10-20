@@ -66,7 +66,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh run download 39415518245 --repo "$GITHUB_REPOSITORY" \
+          gh run download 39426190700 --repo "$GITHUB_REPOSITORY" \
             --name cap-screenshot-smoke-macos-15 --dir "$RUNNER_TEMP/image-validation/input"
       - name: Check real images, wrong images, and exact interior comparison
         run: |

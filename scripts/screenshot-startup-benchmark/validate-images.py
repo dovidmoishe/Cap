@@ -45,8 +45,8 @@ def validate(fixture, inputs, output):
         if not report.get("containsFixtureColors"):
             raise ValueError(f"Saved evidence lacks substantial fixture color regions: {image}")
     previous = check("saved-comparison", ["--compare-images", *originals], True, "interiorMatches")
-    if previous["exteriorDifferentPixels"] != 8:
-        raise ValueError("Pinned input difference no longer reproduces the investigated eight pixels")
+    if previous["exteriorDifferentPixels"] != 36:
+        raise ValueError("Pinned run 39426190700 no longer reproduces its investigated 36 border pixels")
 
     width, height = 96, 64
     colors = [(237, 40, 39), (15, 75, 235), (0, 209, 66)]
