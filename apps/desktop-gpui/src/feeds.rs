@@ -2361,8 +2361,105 @@ mod tests {
         assert_preview_bytes(image.as_bytes(0).unwrap(), &[130, 130, 130, 255].repeat(4));
     }
 
+    fn report_swscale_flag(name: &str, flags: ffmpeg::software::scaling::Flags) {
+        let mut frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::NV12, 128, 16);
+        eprintln!(
+            "GAPDIAG frame y_stride={} uv_stride={} y_len={} uv_len={}",
+            frame.stride(0),
+            frame.stride(1),
+            frame.data(0).len(),
+            frame.data(1).len()
+        );
+        for plane in 0..2 {
+            for (index, byte) in frame.data_mut(plane).iter_mut().enumerate() {
+                *byte = index.wrapping_mul(17).wrapping_add(plane * 41) as u8;
+            }
+        }
+        let Some(kernel) = cap_gpui_kernels::camera_bgra::nv12_to_bgra(
+            frame.data(0),
+            frame.data(1),
+            frame.width() as usize,
+            frame.height() as usize,
+            frame.stride(0),
+            frame.stride(1),
+            false,
+        ) else {
+            eprintln!(
+                "GAPDIAG flag={name} kernel=None simd={}",
+                cap_gpui_kernels::camera_bgra::simd_path()
+            );
+            return;
+        };
+        let mut scaler = ffmpeg::software::scaling::Context::get(
+            frame.format(),
+            frame.width(),
+            frame.height(),
+            ffmpeg::format::Pixel::BGRA,
+            frame.width(),
+            frame.height(),
+            flags,
+        )
+        .unwrap();
+        let mut converted = ffmpeg::frame::Video::empty();
+        scaler.run(&frame, &mut converted).unwrap();
+        let reference = cap_gpui_kernels::frame::copy_rows(
+            converted.data(0),
+            frame.width() as usize * 4,
+            converted.stride(0),
+            frame.height() as usize,
+            false,
+        )
+        .unwrap();
+        let mut max = 0u8;
+        let mut at = 0usize;
+        for (index, (kernel_byte, reference_byte)) in kernel.iter().zip(&reference).enumerate() {
+            let delta = kernel_byte.abs_diff(*reference_byte);
+            if delta > max {
+                max = delta;
+                at = index;
+            }
+        }
+        let width = frame.width() as usize;
+        eprintln!(
+            "GAPDIAG flag={name} sws={} ({}.{}.{}) out_stride={} max_gap={max} x={} y={} channel={} kernel={} reference={}",
+            ffmpeg::software::scaling::version(),
+            ffmpeg::software::scaling::version() >> 16,
+            (ffmpeg::software::scaling::version() >> 8) & 0xff,
+            ffmpeg::software::scaling::version() & 0xff,
+            converted.stride(0),
+            (at / 4) % width,
+            at / (width * 4),
+            ["B", "G", "R", "A"][at % 4],
+            kernel[at],
+            reference[at],
+        );
+    }
+
     #[test]
     fn preview_stays_within_three_codes_of_swscale_bilinear() {
+        let sws = ffmpeg::software::scaling::version();
+        eprintln!(
+            "GAPDIAG arch={} simd={} swscale_version={sws} ({}.{}.{}) config={}",
+            std::env::consts::ARCH,
+            cap_gpui_kernels::camera_bgra::simd_path(),
+            sws >> 16,
+            (sws >> 8) & 0xff,
+            sws & 0xff,
+            ffmpeg::software::scaling::configuration(),
+        );
+        report_swscale_flag("BILINEAR", ffmpeg::software::scaling::Flags::BILINEAR);
+        report_swscale_flag(
+            "BILINEAR|ACCURATE_RND",
+            ffmpeg::software::scaling::Flags::BILINEAR
+                | ffmpeg::software::scaling::Flags::ACCURATE_RND,
+        );
+        report_swscale_flag(
+            "BILINEAR|ACCURATE_RND|FULL_CHR_H_INT",
+            ffmpeg::software::scaling::Flags::BILINEAR
+                | ffmpeg::software::scaling::Flags::ACCURATE_RND
+                | ffmpeg::software::scaling::Flags::FULL_CHR_H_INT,
+        );
+        report_swscale_flag("POINT", ffmpeg::software::scaling::Flags::POINT);
         if !preview_uses_kernel() {
             for pixel in [
                 ffmpeg::format::Pixel::YUYV422,
